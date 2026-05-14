@@ -144,10 +144,10 @@ serve(async (req) => {
 
   // Verify user belongs to this org
   const { data: member } = await supabase
-    .from('org_members')
+    .from('users')
     .select('id')
     .eq('org_id', orgId)
-    .eq('user_id', user.id)
+    .eq('id', user.id)
     .single();
 
   if (!member) return new Response('Forbidden', { status: 403 });

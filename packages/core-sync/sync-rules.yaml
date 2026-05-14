@@ -303,6 +303,17 @@ bucket_definitions:
         WHERE org_id = bucket.org_id::uuid
 
   # ---------------------------------------------------------------------------
+  # PRICE BOOK — ALL ROLES (needed for on-site estimate creation)
+  # ---------------------------------------------------------------------------
+  price_book_by_org:
+    parameters: >
+      SELECT request.jwt() ->> 'org_id' AS org_id
+      WHERE request.jwt() ->> 'org_id' IS NOT NULL
+
+    data:
+      - SELECT * FROM price_book WHERE org_id = bucket.org_id::uuid AND active = true
+
+  # ---------------------------------------------------------------------------
   # LEADLOCK — OWNER + ADMIN ONLY
   # Leads, sequences, and recent messages for the org.
   # ---------------------------------------------------------------------------
@@ -317,3 +328,15 @@ bucket_definitions:
       - SELECT * FROM lead_messages
         WHERE org_id = bucket.org_id::uuid
           AND sent_at > now() - interval '90 days'
+
+  # ---------------------------------------------------------------------------
+  # REPUGUARD — OWNER + ADMIN ONLY
+  # Review request tracking for the org.
+  # ---------------------------------------------------------------------------
+  repuguard_by_org:
+    parameters: >
+      SELECT request.jwt() ->> 'org_id' AS org_id
+      WHERE request.jwt() ->> 'user_role' IN ('owner', 'admin')
+
+    data:
+      - SELECT * FROM review_requests WHERE org_id = bucket.org_id::uuid

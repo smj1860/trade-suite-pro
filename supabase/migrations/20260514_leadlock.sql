@@ -60,11 +60,11 @@ ALTER TABLE public.lead_sequences ENABLE ROW LEVEL SECURITY;
 ALTER TABLE public.lead_messages  ENABLE ROW LEVEL SECURITY;
 
 CREATE POLICY "leads_org"          ON public.leads
-  USING (org_id = (SELECT org_id FROM public.org_members WHERE user_id = auth.uid() LIMIT 1));
+  USING (org_id = (SELECT org_id FROM public.users WHERE id = auth.uid() LIMIT 1));
 CREATE POLICY "lead_sequences_org" ON public.lead_sequences
-  USING (org_id = (SELECT org_id FROM public.org_members WHERE user_id = auth.uid() LIMIT 1));
+  USING (org_id = (SELECT org_id FROM public.users WHERE id = auth.uid() LIMIT 1));
 CREATE POLICY "lead_messages_org"  ON public.lead_messages
-  USING (org_id = (SELECT org_id FROM public.org_members WHERE user_id = auth.uid() LIMIT 1));
+  USING (org_id = (SELECT org_id FROM public.users WHERE id = auth.uid() LIMIT 1));
 
 CREATE POLICY "leads_service"          ON public.leads          TO service_role USING (true) WITH CHECK (true);
 CREATE POLICY "lead_sequences_service" ON public.lead_sequences TO service_role USING (true) WITH CHECK (true);

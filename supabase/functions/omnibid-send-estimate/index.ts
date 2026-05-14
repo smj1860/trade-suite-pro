@@ -1,153 +1,112 @@
+import { serve }        from 'https://deno.land/std@0.177.0/http/server.ts';
 import { createClient } from 'https://esm.sh/@supabase/supabase-js@2';
-import Stripe from 'https://esm.sh/stripe@14?target=deno';
+import Stripe           from 'https://esm.sh/stripe@14';
+import { Resend }       from 'https://esm.sh/resend@3';
 
-const supabase = createClient(
-  Deno.env.get('SUPABASE_URL')!,
-  Deno.env.get('SUPABASE_SERVICE_ROLE_KEY')!
-);
+const supabase = createClient(Deno.env.get('SUPABASE_URL')!, Deno.env.get('SUPABASE_SERVICE_ROLE_KEY')!);
+const stripe   = new Stripe(Deno.env.get('STRIPE_SECRET_KEY')!);
+const resend   = new Resend(Deno.env.get('RESEND_API_KEY')!);
 
-const stripe = new Stripe(Deno.env.get('STRIPE_SECRET_KEY')!, { apiVersion: '2024-04-10' });
-
-const INNGEST_EVENT_KEY = Deno.env.get('INNGEST_EVENT_KEY') ?? '';
-const INNGEST_URL       = Deno.env.get('INNGEST_URL') ?? 'https://inn.gs/e';
-
-async function buildHtmlEmail(params: {
-  estimateNumber: string;
-  customerName: string;
-  orgName: string;
-  totalCents: number;
-  paymentLinkUrl: string;
-  lineItems: Array<{ description: string; total_cents: number }>;
-}): Promise<string> {
-  const { estimateNumber, customerName, orgName, totalCents, paymentLinkUrl, lineItems } = params;
-  const total = (totalCents / 100).toLocaleString('en-US', { style: 'currency', currency: 'USD' });
-
-  const itemRows = lineItems
-    .map(i => `<tr><td style="padding:8px 0;border-bottom:1px solid #3d3d3d">${i.description}</td><td style="padding:8px 0;border-bottom:1px solid #3d3d3d;text-align:right">${(i.total_cents/100).toLocaleString('en-US',{style:'currency',currency:'USD'})}</td></tr>`)
-    .join('');
-
-  return `<!DOCTYPE html>
-<html>
-<body style="background:#1A1A1A;color:#fff;font-family:system-ui,sans-serif;margin:0;padding:32px">
-  <div style="max-width:600px;margin:0 auto">
-    <h1 style="color:#FF6600;font-size:28px;margin:0 0 8px">${orgName}</h1>
-    <p style="color:#C0C0C0;margin:0 0 32px">Estimate ${estimateNumber}</p>
-    <p>Hi ${customerName ?? 'there'},</p>
-    <p>Here is your estimate from ${orgName}. Please review and accept below.</p>
-    <table style="width:100%;margin:24px 0">
-      <thead><tr><th style="text-align:left;color:#C0C0C0;font-size:12px;padding-bottom:8px">Item</th><th style="text-align:right;color:#C0C0C0;font-size:12px;padding-bottom:8px">Total</th></tr></thead>
-      <tbody>${itemRows}</tbody>
-      <tfoot><tr><td style="padding-top:16px;font-weight:bold;font-size:18px">Total</td><td style="padding-top:16px;font-weight:bold;font-size:18px;text-align:right;color:#FF6600">${total}</td></tr></tfoot>
-    </table>
-    <a href="${paymentLinkUrl}" style="display:inline-block;background:#FF6600;color:#fff;text-decoration:none;padding:16px 32px;border-radius:8px;font-weight:bold;font-size:16px;margin:24px 0">Accept & Pay ${total}</a>
-    <p style="color:#6b6b6b;font-size:12px;margin-top:32px">This estimate was prepared by ${orgName}.</p>
-  </div>
-</body>
-</html>`;
+function fmt(cents: number) {
+  return (cents / 100).toLocaleString('en-US', { style: 'currency', currency: 'USD' });
 }
 
-Deno.serve(async (req: Request) => {
+serve(async (req) => {
   if (req.method !== 'POST') return new Response('Method not allowed', { status: 405 });
 
   const authHeader = req.headers.get('Authorization');
   if (!authHeader) return new Response('Unauthorized', { status: 401 });
-
-  const { data: { user }, error: authErr } = await supabase.auth.getUser(authHeader.replace('Bearer ', ''));
-  if (authErr || !user) return new Response('Unauthorized', { status: 401 });
+  const { data: { user } } = await supabase.auth.getUser(authHeader.replace('Bearer ', ''));
+  if (!user) return new Response('Unauthorized', { status: 401 });
 
   const { estimate_id } = await req.json() as { estimate_id: string };
 
-  // Fetch estimate + items + customer + org
   const { data: estimate } = await supabase
     .from('estimates')
-    .select('*, customer:customers(*), org:organizations(*)')
+    .select('*, customers(*), organizations(*)')
     .eq('id', estimate_id)
     .single();
 
   if (!estimate) return new Response('Not found', { status: 404 });
 
-  const { data: lineItems } = await supabase
+  const { data: items } = await supabase
     .from('estimate_line_items')
-    .select('description, total_cents, is_customer_facing')
+    .select('*')
     .eq('estimate_id', estimate_id)
-    .eq('is_customer_facing', true)
     .order('sort_order');
 
+  const customer = (estimate as any).customers;
+  const org      = (estimate as any).organizations;
+
+  if (!customer?.email) return new Response('Customer email required', { status: 400 });
+
+  const { data: member } = await supabase
+    .from('users').select('id').eq('org_id', estimate.org_id).eq('id', user.id).single();
+  if (!member) return new Response('Forbidden', { status: 403 });
+
   try {
-    // Create Stripe Payment Link
-    const product = await stripe.products.create({
-      name: `Estimate ${estimate.estimate_number} — ${estimate.org.name}`,
-    });
     const price = await stripe.prices.create({
-      product: product.id,
-      unit_amount: estimate.total_cents,
-      currency: 'usd',
+      currency:     'usd',
+      unit_amount:  estimate.total_cents,
+      product_data: { name: `${org.name} — Estimate ${estimate.estimate_number}` },
     });
-    const paymentLink = await stripe.paymentLinks.create({
+    const link = await stripe.paymentLinks.create({
       line_items: [{ price: price.id, quantity: 1 }],
-      metadata: { estimate_id, org_id: estimate.org_id },
+      metadata:   { estimate_id, org_id: estimate.org_id },
     });
 
-    // Send email via Resend
-    const customerEmail: string = estimate.customer?.email;
-    const customerName: string  = estimate.customer?.name ?? '';
+    const rows = (items ?? []).map((item: any) =>
+      `<tr>
+        <td style="padding:8px 0;border-bottom:1px solid #2d2d2d">${item.description}</td>
+        <td style="padding:8px 0;border-bottom:1px solid #2d2d2d;text-align:right">${item.quantity} ${item.unit ?? ''}</td>
+        <td style="padding:8px 0;border-bottom:1px solid #2d2d2d;text-align:right;font-weight:600">${fmt(item.total_cents)}</td>
+      </tr>`
+    ).join('');
 
-    if (customerEmail) {
-      const html = await buildHtmlEmail({
-        estimateNumber: estimate.estimate_number,
-        customerName,
-        orgName: estimate.org.name,
-        totalCents: estimate.total_cents,
-        paymentLinkUrl: paymentLink.url,
-        lineItems: lineItems ?? [],
-      });
+    const html = `<!DOCTYPE html><html><body style="font-family:Inter,system-ui,sans-serif;background:#1A1A1A;color:#fff;max-width:600px;margin:0 auto;padding:32px 20px">
+      <h1 style="font-size:24px;margin:0 0 4px">${org.name}</h1>
+      <p style="color:#C0C0C0;margin:0 0 32px">${estimate.estimate_number}</p>
+      <table style="width:100%;border-collapse:collapse;margin-bottom:24px">
+        <thead><tr style="border-bottom:2px solid #FF6600">
+          <th style="text-align:left;padding-bottom:8px;color:#C0C0C0">Description</th>
+          <th style="text-align:right;padding-bottom:8px;color:#C0C0C0">Qty</th>
+          <th style="text-align:right;padding-bottom:8px;color:#C0C0C0">Total</th>
+        </tr></thead>
+        <tbody>${rows}</tbody>
+      </table>
+      <div style="text-align:right;margin-bottom:32px">
+        <p style="color:#C0C0C0">Subtotal: <strong style="color:#fff">${fmt(estimate.subtotal_cents)}</strong></p>
+        <p style="color:#C0C0C0">Tax: <strong style="color:#fff">${fmt(estimate.tax_cents)}</strong></p>
+        <p style="font-size:20px">Total: <strong style="color:#FF6600">${fmt(estimate.total_cents)}</strong></p>
+      </div>
+      ${estimate.customer_note ? `<div style="background:#2D2D2D;padding:16px;border-radius:8px;margin-bottom:32px"><p style="margin:0;color:#C0C0C0">Notes</p><p style="margin:8px 0 0">${estimate.customer_note}</p></div>` : ''}
+      <div style="text-align:center;background:#FF6600;border-radius:12px;padding:32px">
+        <p style="color:#fff;font-size:18px;font-weight:700;margin:0 0 16px">Ready to move forward?</p>
+        <a href="${link.url}" style="display:inline-block;background:#fff;color:#FF6600;padding:14px 32px;border-radius:8px;text-decoration:none;font-weight:700;font-size:16px">Accept &amp; Pay Online</a>
+      </div>
+    </body></html>`;
 
-      await fetch('https://api.resend.com/emails', {
-        method: 'POST',
-        headers: {
-          'Authorization': `Bearer ${Deno.env.get('RESEND_API_KEY')}`,
-          'Content-Type': 'application/json',
-        },
-        body: JSON.stringify({
-          from: `${estimate.org.name} <estimates@${Deno.env.get('RESEND_DOMAIN') ?? 'mail.tradesuite.app'}>`,
-          to: [customerEmail],
-          subject: `Estimate ${estimate.estimate_number} from ${estimate.org.name}`,
-          html,
-        }),
-      });
-    }
+    await resend.emails.send({
+      from:    `${org.name} <estimates@mail.tradesuite.com>`,
+      to:      [customer.email],
+      subject: `Your estimate from ${org.name} — ${estimate.estimate_number}`,
+      html,
+    });
 
-    // Update estimate status
     await supabase.from('estimates').update({
-      status: 'sent',
-      sent_at: new Date().toISOString(),
+      status:   'sent',
+      sent_at:  new Date().toISOString(),
       sent_via: 'email',
-      updated_at: new Date().toISOString(),
+      pdf_url:  link.url,
     }).eq('id', estimate_id);
 
-    // Fire Inngest event
-    await fetch(`${INNGEST_URL}/${INNGEST_EVENT_KEY}`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        name: 'omnibid/estimate.sent',
-        data: {
-          estimate_id,
-          org_id: estimate.org_id,
-          customer_email: customerEmail,
-          customer_name: customerName,
-          payment_link_url: paymentLink.url,
-        },
-      }),
-    });
-
-    return new Response(JSON.stringify({ payment_link_url: paymentLink.url }), {
+    return new Response(JSON.stringify({ payment_link_url: link.url }), {
       headers: { 'Content-Type': 'application/json' },
     });
   } catch (err) {
-    return new Response(
-      JSON.stringify({ error: (err as Error).message }),
-      { status: 500, headers: { 'Content-Type': 'application/json' } }
-    );
+    console.error('omnibid-send-estimate error:', err);
+    return new Response(JSON.stringify({ error: (err as Error).message }), {
+      status: 500, headers: { 'Content-Type': 'application/json' },
+    });
   }
 });
