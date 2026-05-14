@@ -29,6 +29,12 @@ const BillingPage     = lazy(() => import('./pages/settings/BillingPage'));
 const EstimatesPage   = lazy(() => import('./pages/EstimatesPage'));
 const LeadsPage       = lazy(() => import('./pages/LeadsPage'));
 const ReviewsPage     = lazy(() => import('./pages/ReviewsPage'));
+const LeadDetailPage  = lazy(() =>
+  import('@trades-saas/leads').then(m => ({ default: m.LeadDetailPage }))
+);
+const EstimateDetailPage = lazy(() =>
+  import('@trades-saas/estimates').then(m => ({ default: m.EstimateDetailPage }))
+);
 
 // =============================================================================
 // LOADING FALLBACK
@@ -113,8 +119,10 @@ export function App() {
                         <Route path="/jobs/:id"     element={<JobDetailPage mode="edit" />} />
                         <Route path="/customers"    element={<CustomersPage />} />
                         <Route path="/calendar"     element={<CalendarPage />} />
-                        <Route path="/estimates"    element={<EstimatesPage />} />
-                        <Route path="/leads"        element={<LeadsPage />} />
+                        <Route path="/estimates"              element={<EstimatesPage />} />
+                        <Route path="/estimates/:estimateId"  element={<EstimateDetailPage />} />
+                        <Route path="/leads"           element={<LeadsPage />} />
+                        <Route path="/leads/:leadId"   element={<LeadDetailPage />} />
                         <Route path="/reviews"      element={<ReviewsPage />} />
                         <Route path="/settings"     element={<SettingsPage />} />
                         <Route path="/settings/billing" element={<BillingPage />} />

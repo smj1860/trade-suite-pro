@@ -304,6 +304,53 @@ const booking_tokens = new Table(
   }
 );
 
+// ─── LeadLock: Leads ─────────────────────────────────────────────────────────
+
+const leads = new Table(
+  {
+    org_id: column.text, phone: column.text, name: column.text,
+    source: column.text, status: column.text, call_sid: column.text,
+    called_number: column.text, missed_at: column.text, replied_at: column.text,
+    created_at: column.text, updated_at: column.text,
+  },
+  { indexes: { by_status: ['status', 'missed_at'] } }
+);
+
+const lead_sequences = new Table({
+  org_id: column.text, lead_id: column.text, status: column.text,
+  current_step: column.integer, inngest_run_id: column.text,
+  created_at: column.text, updated_at: column.text,
+});
+
+const lead_messages = new Table(
+  {
+    org_id: column.text, lead_id: column.text, sequence_id: column.text,
+    direction: column.text, body: column.text, status: column.text,
+    telnyx_msg_id: column.text, sequence_step: column.integer,
+    sent_at: column.text, created_at: column.text,
+  },
+  { indexes: { by_lead: ['lead_id', 'sent_at'] } }
+);
+
+// ─── OmniBid: Price Book ─────────────────────────────────────────────────────
+
+const price_book = new Table(
+  {
+    org_id:      column.text,
+    name:        column.text,
+    description: column.text,
+    category:    column.text,
+    unit:        column.text,
+    unit_price:  column.real,
+    taxable:     column.integer,
+    aliases:     column.text,
+    active:      column.integer,
+    created_at:  column.text,
+    updated_at:  column.text,
+  },
+  { indexes: { by_category: ['category', 'name'] } }
+);
+
 // ─── OmniBid: Estimates ──────────────────────────────────────────────────────
 
 const estimates = new Table(
@@ -442,7 +489,13 @@ export const AppSchema = new Schema({
   follow_up_sequences,
   booking_tokens,
 
+  // LeadLock
+  leads,
+  lead_sequences,
+  lead_messages,
+
   // OmniBid
+  price_book,
   estimates,
   estimate_line_items,
   invoices,

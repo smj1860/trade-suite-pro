@@ -1,12 +1,29 @@
 {
   "name": "@trades-saas/leads",
-  "displayName": "LeadLock (name TBC)",
+  "displayName": "LeadLock",
   "version": "0.0.1",
   "private": true,
+  "main": "./src/index.ts",
   "scripts": {
-    "build": "echo 'stub'"
+    "type-check": "tsc --noEmit",
+    "build": "echo stub"
   },
   "dependencies": {
-    "@trades-saas/core-types": "workspace:*"
+    "@trades-saas/core-auth": "workspace:*",
+    "@trades-saas/core-sync": "workspace:*",
+    "@trades-saas/core-types": "workspace:*",
+    "@trades-saas/core-ui": "workspace:*",
+    "date-fns": "^3.0.0"
+  },
+  "peerDependencies": {
+    "react": "^18.0.0"
+  },
+  "devDependencies": {
+    "@powersync/react": "^1.10.0",
+    "@powersync/web": "^1.0.0",
+    "@types/react": "^18.3.0",
+    "@types/react-router-dom": "^5.3.3",
+    "react": "^18.3.0",
+    "react-router-dom": "^6.23.0"
   }
 }

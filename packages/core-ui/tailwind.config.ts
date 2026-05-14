@@ -13,6 +13,12 @@ const config: Config = {
   content: [],   // consuming app provides content paths
   theme: {
     extend: {
+      fontFamily: {
+        display: ['"Inter"', 'system-ui', 'sans-serif'],
+        sans:    ['"Inter"', 'system-ui', 'sans-serif'],
+        mono:    ['"Inter"', 'system-ui', 'sans-serif'],
+      },
+
       colors: {
         brand: {
           darkest: BRAND.darkest,

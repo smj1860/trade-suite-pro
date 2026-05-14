@@ -1,130 +1,99 @@
 // =============================================================================
 // TRADESUITE DESIGN TOKENS
-//
-// Aesthetic direction: Industrial Precision
-// Field-ready tool for contractors — high contrast, readable in direct sunlight,
-// large touch targets for gloved hands, dense information display.
-//
-// Brand: Deep forest green (#093b31) + Amber gold accent (#e8a838)
-// Type: Sora (display/headings) + DM Mono (data/numbers)
+// Theme: Safety Orange / Dark (Industrial Precision)
+// Brand: Safety Orange (#FF6600) on Deep Tread dark (#1A1A1A)
+// Secondary: Utility Silver (#C0C0C0)
+// Font: Inter
 // =============================================================================
 
-// ─── Brand Colors ─────────────────────────────────────────────────────────────
-
 export const BRAND = {
-  darkest:  '#051f19',
-  dark:     '#093b31',   // primary brand — nav, buttons, headers
-  mid:      '#145e4a',   // hover states
-  light:    '#1a7a5e',   // active/pressed states
-  pale:     '#e8f4f0',   // tinted backgrounds, selected states
+  darkest:  '#cc4400',
+  dark:     '#FF6600',   // Safety Orange — primary brand
+  mid:      '#e65c00',   // hover states
+  light:    '#ff8533',   // active/selected
+  pale:     '#fff0e6',   // light tint
 } as const;
 
 export const ACCENT = {
-  DEFAULT: '#e8a838',    // amber gold — primary CTA, urgency indicators
-  light:   '#f5c96a',
-  dark:    '#c48820',
+  DEFAULT: '#C0C0C0',   // Utility Silver
+  light:   '#d9d9d9',
+  dark:    '#9a9a9a',
 } as const;
-
-// ─── Surface Colors ───────────────────────────────────────────────────────────
 
 export const SURFACE = {
-  DEFAULT:  '#f8f7f4',   // warm off-white — main background
-  raised:   '#ffffff',   // cards, modals
-  sunken:   '#ede9e2',   // inputs, code blocks
-  border:   '#ddd8ce',   // dividers, input borders
+  DEFAULT:  '#1A1A1A',   // Deep Tread — base background
+  raised:   '#2D2D2D',   // Charcoal Gray — cards, modals
+  sunken:   '#141414',   // inputs, code blocks
+  border:   '#3d3d3d',   // dividers, borders
 } as const;
-
-export const SURFACE_DARK = {
-  DEFAULT:  '#0e1a16',   // dark mode background
-  raised:   '#152820',   // dark mode cards
-  sunken:   '#1c3529',   // dark mode inputs
-  border:   '#2a4a3a',   // dark mode borders
-} as const;
-
-// ─── Text Colors ──────────────────────────────────────────────────────────────
 
 export const TEXT = {
-  DEFAULT:   '#1a1a18',  // primary text
-  secondary: '#4a4a44',  // secondary/supporting text
-  muted:     '#8a8a80',  // placeholder, disabled, timestamps
-  inverse:   '#f8f7f4',  // text on dark backgrounds
+  DEFAULT:   '#FFFFFF',   // Clean White — primary text
+  secondary: '#C0C0C0',   // Utility Silver — labels, metadata
+  muted:     '#6b6b6b',   // placeholders, timestamps
+  inverse:   '#1A1A1A',   // text on orange backgrounds
 } as const;
-
-// ─── Semantic Colors ──────────────────────────────────────────────────────────
 
 export const SEMANTIC = {
-  danger:   '#dc2626',
-  warning:  '#d97706',
-  success:  '#16a34a',
-  info:     '#2563eb',
+  danger:   '#f87171',   // red-400
+  warning:  '#fbbf24',   // amber-400
+  success:  '#34d399',   // emerald-400
+  info:     '#60a5fa',   // blue-400
 } as const;
-
-// ─── Job Status Colors ────────────────────────────────────────────────────────
-// Each status has an immediate visual signature. Contractors read these
-// at a glance while scrolling a job list.
 
 export const STATUS_COLORS = {
-  lead:      { bg: '#fef3c7', text: '#92400e', border: '#fbbf24', dot: '#f59e0b' },
-  scheduled: { bg: '#dbeafe', text: '#1e3a8a', border: '#93c5fd', dot: '#3b82f6' },
-  active:    { bg: '#d1fae5', text: '#065f46', border: '#6ee7b7', dot: '#10b981' },
-  complete:  { bg: '#e8f4f0', text: '#093b31', border: '#a7d4c5', dot: '#093b31' },
-  closed:    { bg: '#f3f4f6', text: '#6b7280', border: '#d1d5db', dot: '#9ca3af' },
-  cancelled: { bg: '#fee2e2', text: '#991b1b', border: '#fca5a5', dot: '#ef4444' },
+  lead:      { bg: '#3d2e00', text: '#fbbf24', border: '#78590a', dot: '#fbbf24' },
+  scheduled: { bg: '#1e2a3d', text: '#60a5fa', border: '#1d4070', dot: '#60a5fa' },
+  active:    { bg: '#1a3d2e', text: '#34d399', border: '#166046', dot: '#34d399' },
+  complete:  { bg: '#2d1a00', text: '#FF6600', border: '#7a3500', dot: '#FF6600' },
+  closed:    { bg: '#242424', text: '#6b6b6b', border: '#3d3d3d', dot: '#6b6b6b' },
+  cancelled: { bg: '#3d1a1a', text: '#f87171', border: '#7f1d1d', dot: '#f87171' },
 } as const;
-
-// ─── Urgency Colors ───────────────────────────────────────────────────────────
-// Maps to OmniBid's urgency_score 1-5
 
 export const URGENCY_COLORS = {
-  1: { bg: '#f3f4f6', text: '#6b7280', label: 'Routine' },
-  2: { bg: '#dbeafe', text: '#1e3a8a', label: '2 weeks' },
-  3: { bg: '#fef3c7', text: '#92400e', label: '1 week' },
-  4: { bg: '#ffedd5', text: '#9a3412', label: 'Urgent' },
-  5: { bg: '#fee2e2', text: '#991b1b', label: 'Emergency' },
+  1: { bg: '#242424', text: '#6b6b6b', label: 'Routine'   },
+  2: { bg: '#1e2a3d', text: '#60a5fa', label: '2 weeks'   },
+  3: { bg: '#3d2e00', text: '#fbbf24', label: '1 week'    },
+  4: { bg: '#3d1e0a', text: '#fb923c', label: 'Urgent'    },
+  5: { bg: '#3d1a1a', text: '#f87171', label: 'Emergency' },
 } as const;
 
-// ─── Typography ───────────────────────────────────────────────────────────────
-
 export const FONTS = {
-  display: '"Sora", system-ui, sans-serif',   // headings, nav labels, job numbers
-  body:    '"Sora", system-ui, sans-serif',   // body text
-  mono:    '"DM Mono", "Fira Code", monospace', // prices, measurements, codes
+  display: '"Inter", system-ui, sans-serif',
+  body:    '"Inter", system-ui, sans-serif',
+  mono:    '"Inter", system-ui, sans-serif',
 } as const;
 
 export const FONT_IMPORTS = [
-  'https://fonts.googleapis.com/css2?family=Sora:wght@300;400;500;600;700&family=DM+Mono:wght@400;500&display=swap',
+  'https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&display=swap',
 ] as const;
 
-// ─── Spacing & Sizing ─────────────────────────────────────────────────────────
-
-export const TOUCH_TARGET = '48px';    // minimum tap target for field use
-export const BOTTOM_NAV_HEIGHT = '64px';
+export const TOUCH_TARGET       = '48px';
+export const BOTTOM_NAV_HEIGHT  = '64px';
 export const PAGE_HEADER_HEIGHT = '56px';
 
-// ─── Shadows ──────────────────────────────────────────────────────────────────
-
 export const SHADOWS = {
-  card:   '0 1px 3px rgba(9, 59, 49, 0.08), 0 1px 2px rgba(9, 59, 49, 0.05)',
-  raised: '0 4px 12px rgba(9, 59, 49, 0.12), 0 2px 4px rgba(9, 59, 49, 0.06)',
-  modal:  '0 20px 60px rgba(5, 31, 25, 0.3)',
+  card:   '0 1px 3px rgba(0,0,0,0.4), 0 1px 2px rgba(0,0,0,0.3)',
+  raised: '0 4px 12px rgba(0,0,0,0.5), 0 2px 4px rgba(0,0,0,0.4)',
+  modal:  '0 20px 60px rgba(0,0,0,0.7)',
+  orange: '0 4px 14px rgba(255,102,0,0.35)',
 } as const;
-
-// ─── CSS Custom Properties (injected into :root) ──────────────────────────────
-// Use these for values that need to be theme-switchable.
 
 export const CSS_VARS = `
   :root {
-    --brand-dark: ${BRAND.dark};
-    --brand-mid: ${BRAND.mid};
-    --brand-pale: ${BRAND.pale};
-    --accent: ${ACCENT.DEFAULT};
-    --surface: ${SURFACE.DEFAULT};
-    --surface-raised: ${SURFACE.raised};
-    --surface-border: ${SURFACE.border};
-    --text: ${TEXT.DEFAULT};
-    --text-muted: ${TEXT.muted};
-    --font-display: ${FONTS.display};
-    --font-mono: ${FONTS.mono};
+    --brand:             ${BRAND.dark};
+    --brand-mid:         ${BRAND.mid};
+    --brand-pale:        ${BRAND.pale};
+    --accent:            ${ACCENT.DEFAULT};
+    --surface:           ${SURFACE.DEFAULT};
+    --surface-raised:    ${SURFACE.raised};
+    --surface-sunken:    ${SURFACE.sunken};
+    --surface-border:    ${SURFACE.border};
+    --text:              ${TEXT.DEFAULT};
+    --text-secondary:    ${TEXT.secondary};
+    --text-muted:        ${TEXT.muted};
+    --font-display:      ${FONTS.display};
+    --font-mono:         ${FONTS.mono};
     --bottom-nav-height: ${BOTTOM_NAV_HEIGHT};
     --page-header-height: ${PAGE_HEADER_HEIGHT};
   }
