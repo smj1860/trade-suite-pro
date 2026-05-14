@@ -469,6 +469,28 @@ const invoice_payments = new Table(
   }
 );
 
+// ─── RepuGuard ───────────────────────────────────────────────────────────────
+
+const review_requests = new Table(
+  {
+    org_id:        column.text,
+    job_id:        column.text,
+    customer_id:   column.text,
+    status:        column.text,
+    sent_via:      column.text,
+    platform:      column.text,
+    review_url:    column.text,
+    sent_at:       column.text,
+    clicked_at:    column.text,
+    reviewed_at:   column.text,
+    star_rating:   column.integer,
+    inngest_run_id: column.text,
+    created_at:    column.text,
+    updated_at:    column.text,
+  },
+  { indexes: { by_status: ['status', 'created_at'] } }
+);
+
 // =============================================================================
 // ASSEMBLED SCHEMA
 // This is what you pass to PowerSyncDatabase({ schema })
@@ -500,6 +522,9 @@ export const AppSchema = new Schema({
   estimate_line_items,
   invoices,
   invoice_payments,
+
+  // RepuGuard
+  review_requests,
 });
 
 export type Database = (typeof AppSchema)['types'];

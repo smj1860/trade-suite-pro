@@ -1,3 +1,4 @@
+import { serve }        from 'https://deno.land/std@0.177.0/http/server.ts';
 import { createClient } from 'https://esm.sh/@supabase/supabase-js@2';
 
 const supabase = createClient(
@@ -66,7 +67,7 @@ Response format:
   return JSON.parse(text);
 }
 
-Deno.serve(async (req: Request) => {
+serve(async (req) => {
   if (req.method !== 'POST') return new Response('Method not allowed', { status: 405 });
 
   const authHeader = req.headers.get('Authorization');
