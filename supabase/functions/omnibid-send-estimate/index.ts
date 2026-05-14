@@ -41,7 +41,7 @@ serve(async (req) => {
   if (!customer?.email) return new Response('Customer email required', { status: 400 });
 
   const { data: member } = await supabase
-    .from('org_members').select('id').eq('org_id', estimate.org_id).eq('user_id', user.id).single();
+    .from('users').select('id').eq('org_id', estimate.org_id).eq('id', user.id).single();
   if (!member) return new Response('Forbidden', { status: 403 });
 
   try {

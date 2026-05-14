@@ -28,7 +28,7 @@ CREATE INDEX ON public.review_requests (customer_id);
 ALTER TABLE public.review_requests ENABLE ROW LEVEL SECURITY;
 
 CREATE POLICY "review_requests_org" ON public.review_requests
-  USING (org_id = (SELECT org_id FROM public.org_members WHERE user_id = auth.uid() LIMIT 1));
+  USING (org_id = (SELECT org_id FROM public.users WHERE id = auth.uid() LIMIT 1));
 CREATE POLICY "review_requests_service" ON public.review_requests
   TO service_role USING (true) WITH CHECK (true);
 

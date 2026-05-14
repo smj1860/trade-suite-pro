@@ -90,7 +90,7 @@ serve(async (req) => {
   }
 
   const { data: member } = await supabase
-    .from('org_members').select('id').eq('org_id', orgId).eq('user_id', user.id).single();
+    .from('users').select('id').eq('org_id', orgId).eq('id', user.id).single();
   if (!member) return new Response('Forbidden', { status: 403 });
 
   try {

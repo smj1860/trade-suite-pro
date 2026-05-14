@@ -20,9 +20,9 @@ serve(async (req) => {
   const { returnUrl } = await req.json() as { returnUrl: string };
 
   const { data: member } = await supabase
-    .from('org_members')
+    .from('users')
     .select('org_id, organizations(stripe_customer_id)')
-    .eq('user_id', user.id)
+    .eq('id', user.id)
     .single();
 
   const stripeCustomerId = (member?.organizations as any)?.stripe_customer_id;

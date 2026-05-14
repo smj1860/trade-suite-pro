@@ -22,7 +22,7 @@ CREATE TRIGGER price_book_updated_at
 ALTER TABLE public.price_book ENABLE ROW LEVEL SECURITY;
 
 CREATE POLICY "price_book_org" ON public.price_book
-  USING (org_id = (SELECT org_id FROM public.org_members WHERE user_id = auth.uid() LIMIT 1));
+  USING (org_id = (SELECT org_id FROM public.users WHERE id = auth.uid() LIMIT 1));
 
 CREATE POLICY "price_book_service" ON public.price_book
   TO service_role USING (true) WITH CHECK (true);
