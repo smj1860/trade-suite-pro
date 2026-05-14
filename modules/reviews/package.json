@@ -3,10 +3,22 @@
   "displayName": "RepuGuard",
   "version": "0.0.1",
   "private": true,
+  "main": "./src/index.ts",
   "scripts": {
-    "build": "echo 'stub'"
+    "type-check": "tsc --noEmit",
+    "build": "echo stub"
   },
   "dependencies": {
-    "@trades-saas/core-types": "workspace:*"
+    "@trades-saas/core-auth": "workspace:*",
+    "@trades-saas/core-sync": "workspace:*",
+    "@trades-saas/core-types": "workspace:*",
+    "@trades-saas/core-ui": "workspace:*"
+  },
+  "peerDependencies": {
+    "react": "^18.0.0"
+  },
+  "devDependencies": {
+    "@types/react": "^18.3.0",
+    "react": "^18.3.0"
   }
 }

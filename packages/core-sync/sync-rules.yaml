@@ -301,3 +301,19 @@ bucket_definitions:
           expires_at, is_revoked, created_at
         FROM booking_tokens
         WHERE org_id = bucket.org_id::uuid
+
+  # ---------------------------------------------------------------------------
+  # LEADLOCK — OWNER + ADMIN ONLY
+  # Leads, sequences, and recent messages for the org.
+  # ---------------------------------------------------------------------------
+  leadlock_by_org:
+    parameters: >
+      SELECT request.jwt() ->> 'org_id' AS org_id
+      WHERE request.jwt() ->> 'user_role' IN ('owner', 'admin')
+
+    data:
+      - SELECT * FROM leads          WHERE org_id = bucket.org_id::uuid
+      - SELECT * FROM lead_sequences WHERE org_id = bucket.org_id::uuid
+      - SELECT * FROM lead_messages
+        WHERE org_id = bucket.org_id::uuid
+          AND sent_at > now() - interval '90 days'

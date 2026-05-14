@@ -1,5 +1,3 @@
-// packages/module-omnibid/src/types.ts
-
 export type EstimateStatus =
   | 'draft'
   | 'sent'
@@ -18,7 +16,7 @@ export interface PriceBookItem {
   description: string | null;
   category: string | null;
   unit: PriceUnit;
-  unit_price: number;
+  unit_price: number;   // dollars (price book stores dollars)
   taxable: boolean;
   aliases: string[] | null;
   active: boolean;
@@ -31,23 +29,25 @@ export interface Estimate {
   org_id: string;
   customer_id: string | null;
   job_id: string | null;
+  created_by: string | null;
   estimate_number: string;
   status: EstimateStatus;
-  title: string | null;
-  notes: string | null;
-  customer_notes: string | null;
-  subtotal: number;
+  ai_generated: number | null;
+  expiry_date: string | null;
+  subtotal_cents: number;
   tax_rate: number;
-  tax_amount: number;
-  total: number;
-  stripe_payment_link_id: string | null;
-  stripe_payment_link_url: string | null;
-  resend_email_id: string | null;
+  tax_cents: number;
+  total_cents: number;
+  customer_note: string | null;
+  internal_note: string | null;
   sent_at: string | null;
+  sent_via: string | null;
   viewed_at: string | null;
+  view_count: number;
   accepted_at: string | null;
-  paid_at: string | null;
-  expires_at: string | null;
+  accepted_tier: string | null;
+  pdf_url: string | null;
+  view_token: string | null;
   created_at: string;
   updated_at: string;
 }
@@ -56,24 +56,22 @@ export interface EstimateItem {
   id: string;
   org_id: string;
   estimate_id: string;
-  price_book_id: string | null;
+  tier: string;
   sort_order: number;
-  name: string;
-  description: string | null;
+  description: string;
+  category: string | null;
   quantity: number;
-  unit: PriceUnit;
-  unit_price: number;
-  line_total: number;          // computed column
-  taxable: boolean;
+  unit: string | null;
+  unit_price_cents: number;
+  total_cents: number;
+  is_customer_facing: number;   // SQLite 0|1
   created_at: string;
 }
 
-// Composed type for the UI
 export interface EstimateWithItems extends Estimate {
   items: EstimateItem[];
 }
 
-// Payload from the voice-parse Edge Function
 export interface VoiceParseResult {
   title: string;
   items: Array<{
@@ -81,13 +79,12 @@ export interface VoiceParseResult {
     quantity: number;
     unit: PriceUnit;
     unit_price: number;
-    price_book_id: string | null;  // matched item, or null if ad-hoc
+    price_book_id: string | null;
     confidence: 'high' | 'medium' | 'low';
   }>;
   raw_transcript: string;
 }
 
-// Inngest event
 export interface EstimateSentEvent {
   name: 'omnibid/estimate.sent';
   data: {

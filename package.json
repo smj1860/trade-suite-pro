@@ -19,5 +19,9 @@
     "node": ">=18",
     "pnpm": ">=8"
   },
-  "packageManager": "pnpm@9.0.0"
+  "packageManager": "pnpm@9.0.0",
+  "dependencies": {
+    "@anthropic-ai/sdk": "^0.36.0",
+    "inngest": "^4.4.0"
+  }
 }
