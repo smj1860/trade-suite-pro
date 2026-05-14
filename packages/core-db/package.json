@@ -1,0 +1,11 @@
+{
+  "name": "@trades-saas/core-db",
+  "version": "0.0.1",
+  "private": true,
+  "scripts": {
+    "db:push": "supabase db push",
+    "db:reset": "supabase db reset",
+    "db:diff": "supabase db diff"
+  },
+  "devDependencies": {}
+}

@@ -1,0 +1,303 @@
+# =============================================================================
+# TRADESUITE — POWERSYNC SYNC RULES
+#
+# These rules run on the PowerSync service (not in the browser).
+# They define which rows from Postgres flow into each client's
+# local SQLite database, based on JWT claims.
+#
+# JWT claims available (set by auth.custom_access_token_hook):
+#   request.jwt() ->> 'org_id'       → the user's organization UUID
+#   request.jwt() ->> 'user_role'    → 'owner' | 'admin' | 'tech'
+#   request.jwt() ->> 'app_user_id'  → the user's public.users UUID
+#
+# Bucket design:
+#   global_by_org         → org config, all users, all customers, assets
+#   jobs_owner_admin      → all jobs (owner + admin only)
+#   jobs_tech             → assigned jobs only (tech only)
+#   job_details_full      → notes, photos, events for all jobs (owner + admin)
+#   job_details_tech      → notes, photos, events for assigned jobs (tech)
+#   estimates_by_org      → estimates + line items (all roles — techs create them)
+#   invoices_by_org       → invoices + payments (owner + admin only)
+#   sequences_by_org      → follow-up sequence state (owner + admin)
+#   booking_by_org        → booking tokens (owner + admin)
+# =============================================================================
+
+bucket_definitions:
+
+  # ---------------------------------------------------------------------------
+  # GLOBAL ORG DATA
+  # Syncs to every user in the org regardless of role.
+  # Includes: org settings, user list, all customers, all customer assets.
+  # Customers are synced in full because techs need contact info on site.
+  # Sensitive columns (stripe keys) are deliberately excluded.
+  # ---------------------------------------------------------------------------
+  global_by_org:
+    parameters: >
+      SELECT request.jwt() ->> 'org_id' AS org_id
+      WHERE request.jwt() ->> 'org_id' IS NOT NULL
+
+    data:
+      # Org — settings only, no Stripe keys on device
+      - SELECT
+          id, name, phone, email, address, city, state, zip,
+          logo_url, trade_types, timezone, active_modules,
+          created_at, updated_at
+        FROM organizations
+        WHERE id = bucket.org_id::uuid
+
+      # All users in org — needed for job assignment display
+      - SELECT
+          id, org_id, name, email, phone, role,
+          is_active, avatar_url, notification_prefs,
+          created_at, updated_at
+        FROM users
+        WHERE org_id = bucket.org_id::uuid
+          AND is_active = true
+
+      # All customers — techs need to call customers on site
+      - SELECT
+          id, org_id, name, phone, email, address, city, state, zip,
+          preferred_contact_method, notes, tags,
+          sms_opt_out, email_opt_out,
+          created_at, updated_at
+        FROM customers
+        WHERE org_id = bucket.org_id::uuid
+
+      # Customer assets — techs need equipment info before they arrive
+      - SELECT
+          id, org_id, customer_id, asset_type, name,
+          make, model, serial_number, refrigerant_type,
+          install_date, warranty_expiry, last_service_date,
+          location_notes, notes, is_active,
+          created_at, updated_at
+        FROM customer_assets
+        WHERE org_id = bucket.org_id::uuid
+          AND is_active = true
+
+      # Job-asset links
+      - SELECT job_id, asset_id, org_id
+        FROM job_assets
+        WHERE org_id = bucket.org_id::uuid
+
+  # ---------------------------------------------------------------------------
+  # ALL JOBS — OWNER + ADMIN ONLY
+  # Owners and admins see every job in the org.
+  # ---------------------------------------------------------------------------
+  jobs_owner_admin:
+    parameters: >
+      SELECT request.jwt() ->> 'org_id' AS org_id
+      WHERE request.jwt() ->> 'user_role' IN ('owner', 'admin')
+
+    data:
+      - SELECT
+          id, org_id, customer_id, title, description,
+          status, source, assigned_to, location, trade_type,
+          scheduled_at, completed_at, estimated_value_cents,
+          final_value_cents, job_number,
+          created_at, updated_at
+        FROM jobs
+        WHERE org_id = bucket.org_id::uuid
+
+  # ---------------------------------------------------------------------------
+  # ASSIGNED JOBS — TECH ONLY
+  # Techs only receive jobs explicitly assigned to them.
+  # When a job is reassigned, it drops out of the old tech's device
+  # and appears on the new tech's device automatically.
+  # ---------------------------------------------------------------------------
+  jobs_tech:
+    parameters: >
+      SELECT
+        request.jwt() ->> 'org_id'      AS org_id,
+        request.jwt() ->> 'app_user_id' AS user_id
+      WHERE request.jwt() ->> 'user_role' = 'tech'
+
+    data:
+      - SELECT
+          id, org_id, customer_id, title, description,
+          status, source, assigned_to, location, trade_type,
+          scheduled_at, completed_at, estimated_value_cents,
+          final_value_cents, job_number,
+          created_at, updated_at
+        FROM jobs
+        WHERE org_id = bucket.org_id::uuid
+          AND assigned_to = bucket.user_id::uuid
+
+  # ---------------------------------------------------------------------------
+  # JOB DETAILS — OWNER + ADMIN
+  # Notes, photos, events, and sequences for all org jobs.
+  # ---------------------------------------------------------------------------
+  job_details_full:
+    parameters: >
+      SELECT request.jwt() ->> 'org_id' AS org_id
+      WHERE request.jwt() ->> 'user_role' IN ('owner', 'admin')
+
+    data:
+      # Field notes — all notes, internal and customer-facing
+      - SELECT
+          id, org_id, job_id, created_by, body,
+          is_customer_facing, is_pinned,
+          created_at, updated_at
+        FROM job_notes
+        WHERE org_id = bucket.org_id::uuid
+
+      # Job photos — metadata only; files are in Supabase Storage
+      - SELECT
+          id, org_id, job_id, asset_id, uploaded_by,
+          photo_type, storage_path, storage_url, filename,
+          mime_type, size_bytes, caption, include_in_report,
+          created_at
+        FROM job_photos
+        WHERE org_id = bucket.org_id::uuid
+
+      # Job events — the inter-module audit log
+      - SELECT
+          id, org_id, job_id, event_type, payload,
+          source_module, created_by, created_at
+        FROM job_events
+        WHERE org_id = bucket.org_id::uuid
+
+      # Follow-up sequence state
+      - SELECT
+          id, org_id, job_id, customer_id, status,
+          current_step, total_steps, trigger_event, source_module,
+          last_fired_at, next_fire_at,
+          cancelled_reason, cancelled_at,
+          created_at, updated_at
+        FROM follow_up_sequences
+        WHERE org_id = bucket.org_id::uuid
+
+      # Communication log — recent 90 days (keeps device storage bounded)
+      - SELECT
+          id, org_id, job_id, customer_id, channel,
+          direction, subject, body, status, source_module,
+          external_id, created_at
+        FROM communication_log
+        WHERE org_id = bucket.org_id::uuid
+          AND created_at > now() - interval '90 days'
+
+  # ---------------------------------------------------------------------------
+  # JOB DETAILS — TECH
+  # Same as above but JOIN-filtered to only assigned jobs.
+  # Internal notes (is_customer_facing = false) are excluded from tech view.
+  # ---------------------------------------------------------------------------
+  job_details_tech:
+    parameters: >
+      SELECT
+        request.jwt() ->> 'org_id'      AS org_id,
+        request.jwt() ->> 'app_user_id' AS user_id
+      WHERE request.jwt() ->> 'user_role' = 'tech'
+
+    data:
+      # Notes — techs see customer-facing notes + their own internal notes
+      - SELECT
+          n.id, n.org_id, n.job_id, n.created_by, n.body,
+          n.is_customer_facing, n.is_pinned,
+          n.created_at, n.updated_at
+        FROM job_notes n
+        JOIN jobs j ON j.id = n.job_id
+        WHERE n.org_id = bucket.org_id::uuid
+          AND j.assigned_to = bucket.user_id::uuid
+          AND (
+            n.is_customer_facing = true
+            OR n.created_by = bucket.user_id::uuid
+          )
+
+      # Photos — all types for assigned jobs
+      - SELECT
+          p.id, p.org_id, p.job_id, p.asset_id, p.uploaded_by,
+          p.photo_type, p.storage_path, p.storage_url, p.filename,
+          p.mime_type, p.size_bytes, p.caption, p.include_in_report,
+          p.created_at
+        FROM job_photos p
+        JOIN jobs j ON j.id = p.job_id
+        WHERE p.org_id = bucket.org_id::uuid
+          AND j.assigned_to = bucket.user_id::uuid
+
+      # Job events for assigned jobs
+      - SELECT
+          e.id, e.org_id, e.job_id, e.event_type, e.payload,
+          e.source_module, e.created_by, e.created_at
+        FROM job_events e
+        JOIN jobs j ON j.id = e.job_id
+        WHERE e.org_id = bucket.org_id::uuid
+          AND j.assigned_to = bucket.user_id::uuid
+
+  # ---------------------------------------------------------------------------
+  # ESTIMATES — ALL ROLES
+  # Techs generate estimates on site, so they need full offline access.
+  # Sensitive internal_note column is excluded from tech bucket.
+  # ---------------------------------------------------------------------------
+  estimates_all_roles:
+    parameters: >
+      SELECT
+        request.jwt() ->> 'org_id'   AS org_id,
+        request.jwt() ->> 'user_role' AS role
+      WHERE request.jwt() ->> 'org_id' IS NOT NULL
+
+    data:
+      # Owner/admin get internal_note; tech does not
+      - SELECT
+          id, org_id, job_id, customer_id, created_by,
+          estimate_number, status, ai_generated, expiry_date,
+          subtotal_cents, tax_rate, tax_cents, total_cents,
+          customer_note,
+          CASE WHEN bucket.role IN ('owner', 'admin')
+            THEN internal_note ELSE NULL END AS internal_note,
+          sent_at, sent_via, viewed_at, view_count,
+          accepted_at, accepted_tier, pdf_url, view_token,
+          created_at, updated_at
+        FROM estimates
+        WHERE org_id = bucket.org_id::uuid
+
+      - SELECT
+          id, org_id, estimate_id, tier, sort_order,
+          description, category, quantity, unit,
+          unit_price_cents, total_cents, is_customer_facing,
+          created_at
+        FROM estimate_line_items
+        WHERE org_id = bucket.org_id::uuid
+
+  # ---------------------------------------------------------------------------
+  # INVOICES — OWNER + ADMIN ONLY
+  # Techs don't need invoice or payment data on their devices.
+  # ---------------------------------------------------------------------------
+  invoices_owner_admin:
+    parameters: >
+      SELECT request.jwt() ->> 'org_id' AS org_id
+      WHERE request.jwt() ->> 'user_role' IN ('owner', 'admin')
+
+    data:
+      - SELECT
+          id, org_id, job_id, customer_id, estimate_id,
+          invoice_number, status, subtotal_cents, tax_cents,
+          total_cents, paid_cents, balance_cents, due_date,
+          customer_note, payment_link_url,
+          sent_at, sent_via, viewed_at, view_count,
+          paid_at, view_token,
+          created_at, updated_at
+        FROM invoices
+        WHERE org_id = bucket.org_id::uuid
+
+      - SELECT
+          id, org_id, invoice_id, amount_cents, method,
+          recorded_by, reference_number, paid_at, notes,
+          created_at
+        FROM invoice_payments
+        WHERE org_id = bucket.org_id::uuid
+
+  # ---------------------------------------------------------------------------
+  # BOOKING TOKENS — OWNER + ADMIN ONLY
+  # Techs have no reason to see booking tokens.
+  # ---------------------------------------------------------------------------
+  booking_owner_admin:
+    parameters: >
+      SELECT request.jwt() ->> 'org_id' AS org_id
+      WHERE request.jwt() ->> 'user_role' IN ('owner', 'admin')
+
+    data:
+      - SELECT
+          id, org_id, job_id, customer_id, token,
+          clicked_at, click_count, booked_at,
+          expires_at, is_revoked, created_at
+        FROM booking_tokens
+        WHERE org_id = bucket.org_id::uuid

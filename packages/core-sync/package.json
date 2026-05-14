@@ -1,0 +1,22 @@
+{
+  "name": "@trades-saas/core-sync",
+  "version": "0.0.1",
+  "private": true,
+  "main": "./src/index.ts",
+  "exports": {
+    ".": "./src/index.ts"
+  },
+  "scripts": {
+    "build": "tsc",
+    "type-check": "tsc --noEmit",
+    "clean": "rm -rf dist"
+  },
+  "dependencies": {
+    "@trades-saas/core-types": "workspace:*",
+    "@trades-saas/core-auth": "workspace:*",
+    "@powersync/web": "^1.0.0"
+  },
+  "devDependencies": {
+    "typescript": "^5.4.0"
+  }
+}

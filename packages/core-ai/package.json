@@ -1,0 +1,19 @@
+{
+  "name": "@trades-saas/core-ai",
+  "version": "0.0.1",
+  "private": true,
+  "main": "./src/index.ts",
+  "exports": { ".": "./src/index.ts" },
+  "scripts": {
+    "build": "tsc",
+    "type-check": "tsc --noEmit",
+    "clean": "rm -rf dist"
+  },
+  "dependencies": {
+    "@trades-saas/core-types": "workspace:*",
+    "@anthropic-ai/sdk": "^0.36.0"
+  },
+  "devDependencies": {
+    "typescript": "^5.4.0"
+  }
+}

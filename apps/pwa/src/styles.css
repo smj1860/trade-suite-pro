@@ -1,0 +1,99 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+/* =============================================================================
+   TRADESUITE GLOBAL STYLES
+   ============================================================================= */
+
+/* CSS custom properties from design tokens */
+:root {
+  --brand-dark:       #093b31;
+  --brand-mid:        #145e4a;
+  --brand-pale:       #e8f4f0;
+  --accent:           #e8a838;
+  --surface:          #f8f7f4;
+  --surface-raised:   #ffffff;
+  --surface-border:   #ddd8ce;
+  --text:             #1a1a18;
+  --text-muted:       #8a8a80;
+  --font-display:     'Sora', system-ui, sans-serif;
+  --font-mono:        'DM Mono', 'Fira Code', monospace;
+  --bottom-nav-height: 64px;
+  --page-header-height: 56px;
+}
+
+/* Base */
+*, *::before, *::after {
+  box-sizing: border-box;
+}
+
+html {
+  /* Prevent iOS rubber-band scroll on body */
+  overscroll-behavior: none;
+  /* Full viewport including safe areas */
+  height: -webkit-fill-available;
+}
+
+body {
+  margin: 0;
+  font-family: var(--font-display);
+  background-color: var(--surface);
+  color: var(--text);
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+  /* Prevent text size adjustment on orientation change */
+  -webkit-text-size-adjust: 100%;
+  /* Prevent overscroll on mobile */
+  overscroll-behavior: none;
+  min-height: 100dvh;
+}
+
+#root {
+  min-height: 100dvh;
+  display: flex;
+  flex-direction: column;
+}
+
+/* Ensure numbers/prices always use mono */
+.font-mono,
+[class*="money-"] {
+  font-family: var(--font-mono);
+  font-variant-numeric: tabular-nums;
+}
+
+/* Smooth scrolling only when not prefers-reduced-motion */
+@media (prefers-reduced-motion: no-preference) {
+  html {
+    scroll-behavior: smooth;
+  }
+}
+
+/* Touch action for interactive elements */
+button, a, [role="button"] {
+  touch-action: manipulation;
+}
+
+/* Remove default button styles */
+button {
+  background: none;
+  border: none;
+  padding: 0;
+  font: inherit;
+  cursor: pointer;
+}
+
+/* Safe area utilities */
+.safe-top    { padding-top:    env(safe-area-inset-top, 0px); }
+.safe-bottom { padding-bottom: env(safe-area-inset-bottom, 0px); }
+
+/* Page transition — subtle fade between routes */
+.page-enter {
+  opacity: 0;
+  transform: translateY(4px);
+}
+.page-enter-active {
+  opacity: 1;
+  transform: translateY(0);
+  transition: opacity 150ms ease-out, transform 150ms ease-out;
+}
