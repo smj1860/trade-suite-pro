@@ -16,7 +16,7 @@ export default function SettingsPage() {
   const [googleUrl,    setGoogleUrl]    = useState((org as any)?.google_review_url    ?? '');
   const [yelpUrl,      setYelpUrl]      = useState((org as any)?.yelp_review_url      ?? '');
   const [facebookUrl,  setFacebookUrl]  = useState((org as any)?.facebook_review_url  ?? '');
-  const [delayHours,   setDelayHours]   = useState<number>((org as any)?.review_delay_hours ?? 2);
+  const [delayHours,   setDelayHours]   = useState<number>((org as any)?.review_delay_hours ?? 24);
   const [savingReview, setSavingReview] = useState(false);
   const [reviewSaved,  setReviewSaved]  = useState(false);
 
