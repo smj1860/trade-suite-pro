@@ -24,6 +24,7 @@ const CustomersPage   = lazy(() => import('./pages/CustomersPage'));
 const CalendarPage    = lazy(() => import('./pages/CalendarPage'));
 const SettingsPage    = lazy(() => import('./pages/settings/SettingsPage'));
 const BillingPage     = lazy(() => import('./pages/settings/BillingPage'));
+const PriceBookPage   = lazy(() => import('./pages/settings/PriceBookPage'));
 
 // Module pages — each only loads if the module is active
 const EstimatesPage   = lazy(() => import('./pages/EstimatesPage'));
@@ -124,8 +125,9 @@ export function App() {
                         <Route path="/leads"           element={<LeadsPage />} />
                         <Route path="/leads/:leadId"   element={<LeadDetailPage />} />
                         <Route path="/reviews"      element={<ReviewsPage />} />
-                        <Route path="/settings"     element={<SettingsPage />} />
-                        <Route path="/settings/billing" element={<BillingPage />} />
+                        <Route path="/settings"              element={<SettingsPage />} />
+                        <Route path="/settings/billing"    element={<BillingPage />} />
+                        <Route path="/settings/price-book" element={<PriceBookPage />} />
                         {/* Fallback */}
                         <Route path="*" element={<Navigate to="/dashboard" replace />} />
                       </Routes>
