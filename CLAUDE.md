@@ -1,1165 +1,1202 @@
-# CLAUDE.md — TradeSuite
-> This is an execution file. Read it top to bottom, then work through every task
-> in order without stopping unless you hit a blocker that requires a decision.
-> Do not ask for confirmation on individual steps — just do them.
+# CLAUDE.md — TradeSuite Phase 3
+> Execution file. Read completely then work top to bottom without pausing.
+> Phase 1 built core + LeadLock. Phase 2 built OmniBid backend, RepuGuard, and Stripe.
+> Phase 3 adds PDF generation, invoice send flow, missing triggers, settings UI, and closes all remaining gaps.
 
 ---
 
-## THE STACK (read before anything else)
-
-- **Framework:** Vite + React 18 — NOT Next.js
-- **Package manager:** pnpm workspaces — never npm or yarn
-- **Monorepo:** Turborepo
-- **Local DB:** PowerSync + SQLite WASM
-- **Cloud DB:** Supabase (Postgres + Auth + Edge Functions)
-- **Orchestration:** Inngest
-- **SMS:** Telnyx
-- **Payments:** Stripe
-- **Email:** Resend
-- **AI:** Claude Sonnet 4 (`claude-sonnet-4-20250514`), Gemini Flash, Llama 4 Scout
-- **Package prefix:** `@trades-saas/` — never `@acme/` or anything else
-- **Modules directory:** `modules/` — not `packages/`
-
----
-
-# TASK LIST — EXECUTE IN ORDER
-
----
-
-## TASK 1 — Verify repo structure is correct
-
-Check that these paths exist. If any are missing, create them as empty stubs:
+## DO NOT RECREATE — CONFIRMED COMPLETE
 
 ```
-apps/pwa/src/pages/LeadsPage.tsx
-apps/pwa/src/pages/EstimatesPage.tsx
-apps/pwa/src/pages/ReviewsPage.tsx
-modules/leads/package.json
-modules/estimates/package.json
-modules/reviews/package.json
-packages/core-ui/src/tokens/index.ts
-packages/core-ui/tailwind.config.ts
-packages/core-sync/src/schema.ts
-packages/core-sync/src/queries.ts
-packages/core-sync/sync-rules.yaml
-supabase/migrations/
-supabase/functions/
-inngest/
+All core packages and migrations
+supabase/functions/stripe-portal/         ✓
+supabase/functions/stripe-webhook/        ✓
+supabase/functions/omnibid-voice-parse/   ✓
+supabase/functions/omnibid-send-estimate/ ✓  (needs PDF upgrade — see Task 2)
+supabase/functions/repuguard-send-request/ ✓
+inngest/serve.ts                          ✓
+inngest/functions/leadlock-sequence.ts    ✓
+inngest/functions/omnibid-estimate-watcher.ts ✓
+inngest/functions/repuguard-sequence.ts   ✓
+modules/leads/                            ✓  complete
+modules/estimates/                        ✓  complete
+modules/reviews/                          ✓  complete
+supabase/migrations/20260514_leadlock.sql ✓
+supabase/migrations/20260515_repuguard.sql ✓
+modules/estimates/supabase/migrations/0001_omnibid_schema.sql ✓
 ```
 
 ---
 
-## TASK 2 — Switch font to Inter everywhere
+## HARD RULES (never break)
 
-### 2a. `apps/pwa/index.html`
-Replace whatever font link tags exist with:
-```html
-<!-- Font: Inter -->
-<link rel="preconnect" href="https://fonts.googleapis.com" />
-<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
-<link
-  href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&display=swap"
-  rel="stylesheet"
-/>
+- Package prefix: `@trades-saas/` only
+- Vite + React 18 — no Next.js patterns
+- Font: Inter only
+- Colors: token classes only (`bg-brand`, `bg-surface`, `bg-surface-raised`, `text-content`, `text-content-secondary`, `text-content-muted`)
+- Reads: PowerSync `useQuery` — never `supabase.from().select()` in components
+- Money: cents in DB, `(cents/100).toLocaleString('en-US',{style:'currency',currency:'USD'})` in display
+- `set_updated_at()` already exists — never redefine
+- Edge Functions: Deno — `https://esm.sh/` or `https://deno.land/` imports only
+- Touch targets: 48px minimum
+
+---
+
+# TASK LIST
+
+---
+
+## TASK 1 — Storage bucket + PDF infrastructure migration
+
+Create `supabase/migrations/20260516_storage_documents.sql`:
+
+```sql
+-- Create the documents storage bucket for PDFs
+INSERT INTO storage.buckets (id, name, public, file_size_limit, allowed_mime_types)
+VALUES (
+  'documents',
+  'documents',
+  false,                          -- private — URLs are signed
+  10485760,                       -- 10MB max per file
+  ARRAY['application/pdf']
+)
+ON CONFLICT (id) DO NOTHING;
+
+-- RLS: users can only read documents for their own org
+CREATE POLICY "documents_org_read" ON storage.objects
+  FOR SELECT USING (
+    bucket_id = 'documents'
+    AND (storage.foldername(name))[1] = (
+      SELECT org_id::text FROM public.users WHERE id = auth.uid() LIMIT 1
+    )
+  );
+
+-- Service role can write (Edge Functions upload PDFs)
+CREATE POLICY "documents_service_write" ON storage.objects
+  FOR INSERT TO service_role WITH CHECK (bucket_id = 'documents');
+
+CREATE POLICY "documents_service_update" ON storage.objects
+  FOR UPDATE TO service_role USING (bucket_id = 'documents');
 ```
-Also set `<meta name="theme-color" content="#FF6600" />`.
 
-### 2b. `packages/core-ui/src/tokens/index.ts`
-Replace the entire file:
+---
+
+## TASK 2 — PDF generation helper (shared Deno module)
+
+Create `supabase/functions/_shared/pdf.ts`.
+This is imported by both `omnibid-send-estimate` and `omnibid-send-invoice`.
+
+PDF generation strategy: POST the HTML to a Gotenberg instance (self-hosted or the free demo).
+Store the resulting PDF bytes in Supabase Storage and return a signed URL.
 
 ```typescript
-// =============================================================================
-// TRADESUITE DESIGN TOKENS
-// Theme: Safety Orange / Dark (Industrial Precision)
-// Brand: Safety Orange (#FF6600) on Deep Tread dark (#1A1A1A)
-// Secondary: Utility Silver (#C0C0C0)
-// Font: Inter
-// =============================================================================
+// supabase/functions/_shared/pdf.ts
+import { createClient } from 'https://esm.sh/@supabase/supabase-js@2';
 
-export const BRAND = {
-  darkest:  '#cc4400',
-  dark:     '#FF6600',   // Safety Orange — primary brand
-  mid:      '#e65c00',   // hover states
-  light:    '#ff8533',   // active/selected
-  pale:     '#fff0e6',   // light tint
-} as const;
+const supabase = createClient(
+  Deno.env.get('SUPABASE_URL')!,
+  Deno.env.get('SUPABASE_SERVICE_ROLE_KEY')!
+);
 
-export const ACCENT = {
-  DEFAULT: '#C0C0C0',   // Utility Silver
-  light:   '#d9d9d9',
-  dark:    '#9a9a9a',
-} as const;
+/**
+ * Convert an HTML string to a PDF using Gotenberg.
+ * Set PDF_API_URL env var to your Gotenberg instance.
+ * Free demo: https://demo.gotenberg.dev  (rate-limited — use for dev only)
+ * Production: deploy Gotenberg to Railway/Fly.io and set the URL.
+ */
+export async function htmlToPdf(html: string): Promise<Uint8Array> {
+  const apiUrl = Deno.env.get('PDF_API_URL') ?? 'https://demo.gotenberg.dev';
 
-export const SURFACE = {
-  DEFAULT:  '#1A1A1A',   // Deep Tread — base background
-  raised:   '#2D2D2D',   // Charcoal Gray — cards, modals
-  sunken:   '#141414',   // inputs, code blocks
-  border:   '#3d3d3d',   // dividers, borders
-} as const;
+  const form = new FormData();
+  form.append(
+    'files',
+    new Blob([html], { type: 'text/html' }),
+    'index.html'
+  );
 
-export const TEXT = {
-  DEFAULT:   '#FFFFFF',   // Clean White — primary text
-  secondary: '#C0C0C0',   // Utility Silver — labels, metadata
-  muted:     '#6b6b6b',   // placeholders, timestamps
-  inverse:   '#1A1A1A',   // text on orange backgrounds
-} as const;
+  // Gotenberg paper size + margins optimised for an invoice/estimate document
+  const res = await fetch(`${apiUrl}/forms/chromium/convert/html`, {
+    method: 'POST',
+    body: form,
+    // Optional Gotenberg headers for paper size
+    headers: {
+      'Gotenberg-Output-Filename': 'document.pdf',
+    },
+  });
 
-export const SEMANTIC = {
-  danger:   '#f87171',   // red-400
-  warning:  '#fbbf24',   // amber-400
-  success:  '#34d399',   // emerald-400
-  info:     '#60a5fa',   // blue-400
-} as const;
-
-export const STATUS_COLORS = {
-  lead:      { bg: '#3d2e00', text: '#fbbf24', border: '#78590a', dot: '#fbbf24' },
-  scheduled: { bg: '#1e2a3d', text: '#60a5fa', border: '#1d4070', dot: '#60a5fa' },
-  active:    { bg: '#1a3d2e', text: '#34d399', border: '#166046', dot: '#34d399' },
-  complete:  { bg: '#2d1a00', text: '#FF6600', border: '#7a3500', dot: '#FF6600' },
-  closed:    { bg: '#242424', text: '#6b6b6b', border: '#3d3d3d', dot: '#6b6b6b' },
-  cancelled: { bg: '#3d1a1a', text: '#f87171', border: '#7f1d1d', dot: '#f87171' },
-} as const;
-
-export const URGENCY_COLORS = {
-  1: { bg: '#242424', text: '#6b6b6b', label: 'Routine'   },
-  2: { bg: '#1e2a3d', text: '#60a5fa', label: '2 weeks'   },
-  3: { bg: '#3d2e00', text: '#fbbf24', label: '1 week'    },
-  4: { bg: '#3d1e0a', text: '#fb923c', label: 'Urgent'    },
-  5: { bg: '#3d1a1a', text: '#f87171', label: 'Emergency' },
-} as const;
-
-export const FONTS = {
-  display: '"Inter", system-ui, sans-serif',
-  body:    '"Inter", system-ui, sans-serif',
-  mono:    '"Inter", system-ui, sans-serif',
-} as const;
-
-export const FONT_IMPORTS = [
-  'https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&display=swap',
-] as const;
-
-export const TOUCH_TARGET       = '48px';
-export const BOTTOM_NAV_HEIGHT  = '64px';
-export const PAGE_HEADER_HEIGHT = '56px';
-
-export const SHADOWS = {
-  card:   '0 1px 3px rgba(0,0,0,0.4), 0 1px 2px rgba(0,0,0,0.3)',
-  raised: '0 4px 12px rgba(0,0,0,0.5), 0 2px 4px rgba(0,0,0,0.4)',
-  modal:  '0 20px 60px rgba(0,0,0,0.7)',
-  orange: '0 4px 14px rgba(255,102,0,0.35)',
-} as const;
-
-export const CSS_VARS = `
-  :root {
-    --brand:             ${BRAND.dark};
-    --brand-mid:         ${BRAND.mid};
-    --brand-pale:        ${BRAND.pale};
-    --accent:            ${ACCENT.DEFAULT};
-    --surface:           ${SURFACE.DEFAULT};
-    --surface-raised:    ${SURFACE.raised};
-    --surface-sunken:    ${SURFACE.sunken};
-    --surface-border:    ${SURFACE.border};
-    --text:              ${TEXT.DEFAULT};
-    --text-secondary:    ${TEXT.secondary};
-    --text-muted:        ${TEXT.muted};
-    --font-display:      ${FONTS.display};
-    --font-mono:         ${FONTS.mono};
-    --bottom-nav-height: ${BOTTOM_NAV_HEIGHT};
-    --page-header-height: ${PAGE_HEADER_HEIGHT};
+  if (!res.ok) {
+    const text = await res.text();
+    throw new Error(`PDF generation failed (${res.status}): ${text}`);
   }
-`;
-```
 
-### 2c. `apps/pwa/src/styles.css`
-Replace entire file:
-
-```css
-@tailwind base;
-@tailwind components;
-@tailwind utilities;
-
-:root {
-  --brand:             #FF6600;
-  --brand-mid:         #e65c00;
-  --brand-pale:        #fff0e6;
-  --accent:            #C0C0C0;
-  --surface:           #1A1A1A;
-  --surface-raised:    #2D2D2D;
-  --surface-sunken:    #141414;
-  --surface-border:    #3d3d3d;
-  --text:              #FFFFFF;
-  --text-secondary:    #C0C0C0;
-  --text-muted:        #6b6b6b;
-  --font-display:      'Inter', system-ui, sans-serif;
-  --font-mono:         'Inter', system-ui, sans-serif;
-  --bottom-nav-height: 64px;
-  --page-header-height: 56px;
+  return new Uint8Array(await res.arrayBuffer());
 }
 
-*, *::before, *::after { box-sizing: border-box; }
+/**
+ * Upload a PDF to Supabase Storage (documents bucket).
+ * Returns a signed URL valid for 7 days.
+ * Path format: {org_id}/{document_type}/{filename}
+ */
+export async function uploadPdf(
+  orgId: string,
+  folder: 'estimates' | 'invoices',
+  filename: string,
+  pdfBytes: Uint8Array
+): Promise<string> {
+  const path = `${orgId}/${folder}/${filename}`;
 
-html {
-  overscroll-behavior: none;
-  height: -webkit-fill-available;
-  color-scheme: dark;
+  const { error } = await supabase.storage
+    .from('documents')
+    .upload(path, pdfBytes, {
+      contentType: 'application/pdf',
+      upsert: true,
+    });
+
+  if (error) throw new Error(`Storage upload failed: ${error.message}`);
+
+  // Signed URL — valid 7 days (604800 seconds)
+  const { data: signed } = await supabase.storage
+    .from('documents')
+    .createSignedUrl(path, 604800);
+
+  if (!signed?.signedUrl) throw new Error('Failed to create signed URL');
+
+  return signed.signedUrl;
 }
 
-body {
-  margin: 0;
-  font-family: var(--font-display);
-  background-color: var(--surface);
-  color: var(--text);
-  -webkit-font-smoothing: antialiased;
-  -moz-osx-font-smoothing: grayscale;
-  -webkit-text-size-adjust: 100%;
-  overscroll-behavior: none;
-  min-height: 100dvh;
+/** Format cents as USD string for use inside PDF HTML templates */
+export function fmtCents(cents: number): string {
+  return (cents / 100).toLocaleString('en-US', { style: 'currency', currency: 'USD' });
 }
-
-#root { min-height: 100dvh; display: flex; flex-direction: column; }
-
-.font-mono, [class*="money-"] {
-  font-family: var(--font-mono);
-  font-variant-numeric: tabular-nums;
-}
-
-@media (prefers-reduced-motion: no-preference) { html { scroll-behavior: smooth; } }
-
-button, a, [role="button"] { touch-action: manipulation; }
-button { background: none; border: none; padding: 0; font: inherit; cursor: pointer; }
-
-.safe-top    { padding-top:    env(safe-area-inset-top, 0px); }
-.safe-bottom { padding-bottom: env(safe-area-inset-bottom, 0px); }
-
-.scrollbar-none { -ms-overflow-style: none; scrollbar-width: none; }
-.scrollbar-none::-webkit-scrollbar { display: none; }
-
-::-webkit-scrollbar       { width: 4px; height: 4px; }
-::-webkit-scrollbar-track { background: #1A1A1A; }
-::-webkit-scrollbar-thumb { background: #3d3d3d; border-radius: 2px; }
-
-input:-webkit-autofill,
-input:-webkit-autofill:hover,
-input:-webkit-autofill:focus {
-  -webkit-box-shadow: 0 0 0px 1000px #2D2D2D inset;
-  -webkit-text-fill-color: #FFFFFF;
-  caret-color: #FFFFFF;
-}
-
-.page-enter { opacity: 0; transform: translateY(4px); }
-.page-enter-active {
-  opacity: 1; transform: translateY(0);
-  transition: opacity 150ms ease-out, transform 150ms ease-out;
-}
-```
-
-### 2d. `apps/pwa/vite.config.ts`
-Update only the manifest colors inside VitePWA:
-```typescript
-theme_color:      '#FF6600',
-background_color: '#1A1A1A',
-```
-
-### 2e. `packages/core-ui/tailwind.config.ts`
-In the `extend` block, update `fontFamily`:
-```typescript
-fontFamily: {
-  display: ['"Inter"', 'system-ui', 'sans-serif'],
-  sans:    ['"Inter"', 'system-ui', 'sans-serif'],
-  mono:    ['"Inter"', 'system-ui', 'sans-serif'],
-},
 ```
 
 ---
 
-## TASK 3 — Install all required dependencies
+## TASK 3 — Update `omnibid-send-estimate` to generate and attach PDF
+
+Replace the entire contents of `supabase/functions/omnibid-send-estimate/index.ts`:
+
+```typescript
+import { serve }        from 'https://deno.land/std@0.177.0/http/server.ts';
+import { createClient } from 'https://esm.sh/@supabase/supabase-js@2';
+import Stripe           from 'https://esm.sh/stripe@14';
+import { Resend }       from 'https://esm.sh/resend@3';
+import { htmlToPdf, uploadPdf, fmtCents } from '../_shared/pdf.ts';
+
+const supabase = createClient(Deno.env.get('SUPABASE_URL')!, Deno.env.get('SUPABASE_SERVICE_ROLE_KEY')!);
+const stripe   = new Stripe(Deno.env.get('STRIPE_SECRET_KEY')!);
+const resend   = new Resend(Deno.env.get('RESEND_API_KEY')!);
+
+function buildEstimateHtml(
+  estimate: Record<string, unknown>,
+  items: Record<string, unknown>[],
+  org: Record<string, unknown>,
+  customer: Record<string, unknown>,
+  paymentUrl: string
+): string {
+  const rows = items
+    .filter((i: any) => i.is_customer_facing)
+    .map((item: any) => `
+      <tr>
+        <td style="padding:10px 0;border-bottom:1px solid #2d2d2d;color:#fff">${item.description}</td>
+        <td style="padding:10px 0;border-bottom:1px solid #2d2d2d;text-align:right;color:#C0C0C0">${item.quantity}${item.unit ? ' ' + item.unit : ''}</td>
+        <td style="padding:10px 0;border-bottom:1px solid #2d2d2d;text-align:right;color:#C0C0C0">${fmtCents(item.unit_price_cents)}</td>
+        <td style="padding:10px 0;border-bottom:1px solid #2d2d2d;text-align:right;font-weight:700;color:#fff">${fmtCents(item.total_cents)}</td>
+      </tr>`)
+    .join('');
+
+  const expiryLine = (estimate as any).expiry_date
+    ? `<p style="color:#f87171;font-size:13px;margin:4px 0 0">Expires ${new Date((estimate as any).expiry_date).toLocaleDateString('en-US', { month: 'long', day: 'numeric', year: 'numeric' })}</p>`
+    : '';
+
+  return `<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <style>
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+    body { font-family: Inter, system-ui, sans-serif; background: #1A1A1A; color: #fff; padding: 48px 40px; }
+    table { width: 100%; border-collapse: collapse; }
+    th { text-align: left; padding-bottom: 10px; border-bottom: 2px solid #FF6600; color: #C0C0C0; font-size: 13px; font-weight: 600; letter-spacing: 0.05em; text-transform: uppercase; }
+    th:not(:first-child) { text-align: right; }
+  </style>
+</head>
+<body>
+  <!-- Header -->
+  <div style="display:flex;justify-content:space-between;align-items:flex-start;margin-bottom:48px">
+    <div>
+      <h1 style="font-size:28px;font-weight:800;color:#fff">${(org as any).name}</h1>
+      ${(org as any).phone ? `<p style="color:#C0C0C0;margin-top:4px">${(org as any).phone}</p>` : ''}
+      ${(org as any).email ? `<p style="color:#C0C0C0">${(org as any).email}</p>` : ''}
+    </div>
+    <div style="text-align:right">
+      <div style="background:#FF6600;color:#fff;font-size:11px;font-weight:700;letter-spacing:0.1em;text-transform:uppercase;padding:4px 12px;border-radius:4px;margin-bottom:8px;display:inline-block">ESTIMATE</div>
+      <p style="font-size:22px;font-weight:700;color:#fff">${(estimate as any).estimate_number}</p>
+      <p style="color:#C0C0C0;font-size:14px;margin-top:4px">
+        ${new Date((estimate as any).created_at).toLocaleDateString('en-US', { month: 'long', day: 'numeric', year: 'numeric' })}
+      </p>
+      ${expiryLine}
+    </div>
+  </div>
+
+  <!-- Bill To -->
+  <div style="margin-bottom:40px;padding:20px;background:#2D2D2D;border-radius:8px">
+    <p style="font-size:11px;font-weight:700;letter-spacing:0.1em;text-transform:uppercase;color:#C0C0C0;margin-bottom:8px">PREPARED FOR</p>
+    <p style="font-weight:700;color:#fff">${(customer as any).first_name ?? ''} ${(customer as any).last_name ?? ''}</p>
+    ${(customer as any).email ? `<p style="color:#C0C0C0;font-size:14px;margin-top:2px">${(customer as any).email}</p>` : ''}
+    ${(customer as any).phone ? `<p style="color:#C0C0C0;font-size:14px;margin-top:2px">${(customer as any).phone}</p>` : ''}
+  </div>
+
+  <!-- Line Items -->
+  <table style="margin-bottom:32px">
+    <thead>
+      <tr>
+        <th style="width:50%">Description</th>
+        <th>Qty</th>
+        <th>Unit Price</th>
+        <th>Total</th>
+      </tr>
+    </thead>
+    <tbody>${rows}</tbody>
+  </table>
+
+  <!-- Totals -->
+  <div style="text-align:right;margin-bottom:40px">
+    <table style="width:280px;margin-left:auto">
+      <tr>
+        <td style="padding:6px 0;color:#C0C0C0">Subtotal</td>
+        <td style="padding:6px 0;text-align:right;color:#fff;font-weight:600">${fmtCents((estimate as any).subtotal_cents)}</td>
+      </tr>
+      <tr>
+        <td style="padding:6px 0;color:#C0C0C0">Tax (${((estimate as any).tax_rate * 100).toFixed(2)}%)</td>
+        <td style="padding:6px 0;text-align:right;color:#fff;font-weight:600">${fmtCents((estimate as any).tax_cents)}</td>
+      </tr>
+      <tr style="border-top:2px solid #FF6600">
+        <td style="padding:12px 0;font-size:18px;font-weight:800;color:#fff">Total</td>
+        <td style="padding:12px 0;text-align:right;font-size:22px;font-weight:800;color:#FF6600">${fmtCents((estimate as any).total_cents)}</td>
+      </tr>
+    </table>
+  </div>
+
+  ${(estimate as any).customer_note ? `
+  <div style="padding:20px;background:#2D2D2D;border-radius:8px;margin-bottom:40px">
+    <p style="font-size:11px;font-weight:700;letter-spacing:0.1em;text-transform:uppercase;color:#C0C0C0;margin-bottom:8px">NOTES</p>
+    <p style="color:#fff;line-height:1.6">${(estimate as any).customer_note}</p>
+  </div>` : ''}
+
+  <!-- CTA -->
+  <div style="background:#FF6600;border-radius:12px;padding:32px;text-align:center">
+    <p style="color:#fff;font-size:18px;font-weight:800;margin-bottom:8px">Ready to move forward?</p>
+    <p style="color:rgba(255,255,255,0.85);font-size:14px;margin-bottom:20px">Accept and pay securely online</p>
+    <a href="${paymentUrl}" style="display:inline-block;background:#fff;color:#FF6600;padding:14px 36px;border-radius:8px;text-decoration:none;font-weight:800;font-size:16px">
+      Accept &amp; Pay — ${fmtCents((estimate as any).total_cents)}
+    </a>
+    <p style="color:rgba(255,255,255,0.6);font-size:12px;margin-top:16px">Powered by Stripe — 100% secure</p>
+  </div>
+</body>
+</html>`;
+}
+
+serve(async (req) => {
+  if (req.method !== 'POST') return new Response('Method not allowed', { status: 405 });
+
+  const authHeader = req.headers.get('Authorization');
+  if (!authHeader) return new Response('Unauthorized', { status: 401 });
+  const { data: { user } } = await supabase.auth.getUser(authHeader.replace('Bearer ', ''));
+  if (!user) return new Response('Unauthorized', { status: 401 });
+
+  const { estimate_id } = await req.json() as { estimate_id: string };
+
+  // Fetch all needed data
+  const [estRes, itemsRes] = await Promise.all([
+    supabase.from('estimates').select('*, customers(*), organizations(*)').eq('id', estimate_id).single(),
+    supabase.from('estimate_line_items').select('*').eq('estimate_id', estimate_id).order('sort_order'),
+  ]);
+
+  if (!estRes.data) return new Response('Estimate not found', { status: 404 });
+
+  const estimate = estRes.data;
+  const items    = itemsRes.data ?? [];
+  const customer = (estimate as any).customers;
+  const org      = (estimate as any).organizations;
+
+  if (!customer?.email) return new Response('Customer email required', { status: 400 });
+
+  // Auth check — user must belong to this org
+  const { data: userRow } = await supabase.from('users').select('id').eq('id', user.id).eq('org_id', estimate.org_id).single();
+  if (!userRow) return new Response('Forbidden', { status: 403 });
+
+  try {
+    // 1. Create Stripe Payment Link
+    const price = await stripe.prices.create({
+      currency: 'usd',
+      unit_amount: estimate.total_cents,
+      product_data: { name: `${org.name} — Estimate ${estimate.estimate_number}` },
+    });
+    const link = await stripe.paymentLinks.create({
+      line_items: [{ price: price.id, quantity: 1 }],
+      metadata: { estimate_id, org_id: estimate.org_id },
+    });
+
+    // 2. Generate PDF
+    const html      = buildEstimateHtml(estimate, items, org, customer, link.url);
+    const pdfBytes  = await htmlToPdf(html);
+    const filename  = `${estimate.estimate_number.replace(/[^a-z0-9-]/gi, '-')}.pdf`;
+    const pdfUrl    = await uploadPdf(estimate.org_id, 'estimates', filename, pdfBytes);
+
+    // 3. Send email with PDF attachment
+    await resend.emails.send({
+      from:    `${org.name} <estimates@mail.tradesuite.com>`,
+      to:      [customer.email],
+      subject: `Your estimate from ${org.name} — ${estimate.estimate_number}`,
+      html: `<div style="font-family:Inter,system-ui,sans-serif;background:#1A1A1A;color:#fff;padding:32px;max-width:600px;margin:0 auto">
+        <h2 style="color:#fff;margin-bottom:8px">Hi ${customer.first_name ?? 'there'},</h2>
+        <p style="color:#C0C0C0;margin-bottom:24px">Please find your estimate attached. You can also view and accept it online:</p>
+        <a href="${link.url}" style="display:inline-block;background:#FF6600;color:#fff;padding:14px 32px;border-radius:8px;text-decoration:none;font-weight:700;font-size:16px;margin-bottom:24px">
+          View &amp; Accept Estimate
+        </a>
+        <p style="color:#6b6b6b;font-size:13px">— ${org.name}</p>
+      </div>`,
+      attachments: [{
+        filename,
+        content: btoa(String.fromCharCode(...pdfBytes)),
+      }],
+    });
+
+    // 4. Update estimate record
+    await supabase.from('estimates').update({
+      status:   'sent',
+      sent_at:  new Date().toISOString(),
+      sent_via: 'email',
+      pdf_url:  pdfUrl,           // now the actual PDF in Storage, not the payment link
+    }).eq('id', estimate_id);
+
+    return new Response(JSON.stringify({ payment_link_url: link.url, pdf_url: pdfUrl }), {
+      headers: { 'Content-Type': 'application/json' },
+    });
+  } catch (err) {
+    console.error('omnibid-send-estimate error:', err);
+    return new Response(JSON.stringify({ error: (err as Error).message }), {
+      status: 500, headers: { 'Content-Type': 'application/json' },
+    });
+  }
+});
+```
+
+Deploy:
+```bash
+supabase functions deploy omnibid-send-estimate
+```
+
+---
+
+## TASK 4 — New `omnibid-send-invoice` Edge Function
+
+Create `supabase/functions/omnibid-send-invoice/index.ts`:
+
+```typescript
+import { serve }        from 'https://deno.land/std@0.177.0/http/server.ts';
+import { createClient } from 'https://esm.sh/@supabase/supabase-js@2';
+import Stripe           from 'https://esm.sh/stripe@14';
+import { Resend }       from 'https://esm.sh/resend@3';
+import { htmlToPdf, uploadPdf, fmtCents } from '../_shared/pdf.ts';
+
+const supabase = createClient(Deno.env.get('SUPABASE_URL')!, Deno.env.get('SUPABASE_SERVICE_ROLE_KEY')!);
+const stripe   = new Stripe(Deno.env.get('STRIPE_SECRET_KEY')!);
+const resend   = new Resend(Deno.env.get('RESEND_API_KEY')!);
+
+function buildInvoiceHtml(
+  invoice: Record<string, unknown>,
+  payments: Record<string, unknown>[],
+  estimate: Record<string, unknown> | null,
+  org: Record<string, unknown>,
+  customer: Record<string, unknown>,
+  paymentUrl: string
+): string {
+  const invoiceData = invoice as any;
+  const orgData     = org as any;
+  const custData    = customer as any;
+  const totalPaid   = payments.reduce((s: number, p: any) => s + (p.amount_cents ?? 0), 0);
+  const balance     = invoiceData.balance_cents ?? (invoiceData.total_cents - totalPaid);
+
+  const isPaid = invoiceData.status === 'paid' || balance <= 0;
+
+  return `<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <style>
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+    body { font-family: Inter, system-ui, sans-serif; background: #1A1A1A; color: #fff; padding: 48px 40px; }
+    table { width: 100%; border-collapse: collapse; }
+    th { text-align: left; padding-bottom: 10px; border-bottom: 2px solid #FF6600; color: #C0C0C0; font-size: 13px; font-weight: 600; letter-spacing: 0.05em; text-transform: uppercase; }
+    th:not(:first-child) { text-align: right; }
+  </style>
+</head>
+<body>
+  <!-- Header -->
+  <div style="display:flex;justify-content:space-between;align-items:flex-start;margin-bottom:48px">
+    <div>
+      <h1 style="font-size:28px;font-weight:800;color:#fff">${orgData.name}</h1>
+      ${orgData.phone ? `<p style="color:#C0C0C0;margin-top:4px">${orgData.phone}</p>` : ''}
+      ${orgData.email ? `<p style="color:#C0C0C0">${orgData.email}</p>` : ''}
+    </div>
+    <div style="text-align:right">
+      <div style="background:${isPaid ? '#166046' : '#FF6600'};color:#fff;font-size:11px;font-weight:700;letter-spacing:0.1em;text-transform:uppercase;padding:4px 12px;border-radius:4px;margin-bottom:8px;display:inline-block">
+        ${isPaid ? 'PAID' : 'INVOICE'}
+      </div>
+      <p style="font-size:22px;font-weight:700;color:#fff">${invoiceData.invoice_number}</p>
+      <p style="color:#C0C0C0;font-size:14px;margin-top:4px">
+        ${new Date(invoiceData.created_at).toLocaleDateString('en-US', { month: 'long', day: 'numeric', year: 'numeric' })}
+      </p>
+      ${invoiceData.due_date ? `<p style="color:${isPaid ? '#34d399' : '#f87171'};font-size:13px;margin-top:4px">
+        Due ${new Date(invoiceData.due_date).toLocaleDateString('en-US', { month: 'long', day: 'numeric', year: 'numeric' })}
+      </p>` : ''}
+    </div>
+  </div>
+
+  <!-- Bill To -->
+  <div style="margin-bottom:40px;padding:20px;background:#2D2D2D;border-radius:8px">
+    <p style="font-size:11px;font-weight:700;letter-spacing:0.1em;text-transform:uppercase;color:#C0C0C0;margin-bottom:8px">BILL TO</p>
+    <p style="font-weight:700;color:#fff">${custData.first_name ?? ''} ${custData.last_name ?? ''}</p>
+    ${custData.email ? `<p style="color:#C0C0C0;font-size:14px;margin-top:2px">${custData.email}</p>` : ''}
+    ${custData.phone ? `<p style="color:#C0C0C0;font-size:14px;margin-top:2px">${custData.phone}</p>` : ''}
+  </div>
+
+  ${estimate ? `<div style="margin-bottom:32px;padding:12px 20px;background:#2D2D2D;border-radius:8px;border-left:3px solid #FF6600">
+    <p style="color:#C0C0C0;font-size:13px">Re: Estimate ${(estimate as any).estimate_number}</p>
+  </div>` : ''}
+
+  <!-- Totals Summary -->
+  <div style="margin-bottom:40px">
+    <table style="width:320px;margin-left:auto">
+      <tr>
+        <td style="padding:8px 0;color:#C0C0C0">Subtotal</td>
+        <td style="padding:8px 0;text-align:right;color:#fff;font-weight:600">${fmtCents(invoiceData.subtotal_cents)}</td>
+      </tr>
+      <tr>
+        <td style="padding:8px 0;color:#C0C0C0">Tax</td>
+        <td style="padding:8px 0;text-align:right;color:#fff;font-weight:600">${fmtCents(invoiceData.tax_cents)}</td>
+      </tr>
+      <tr style="border-top:1px solid #3d3d3d">
+        <td style="padding:10px 0;font-weight:700;color:#fff">Invoice Total</td>
+        <td style="padding:10px 0;text-align:right;font-weight:700;color:#fff">${fmtCents(invoiceData.total_cents)}</td>
+      </tr>
+      ${totalPaid > 0 ? `<tr>
+        <td style="padding:8px 0;color:#34d399">Paid</td>
+        <td style="padding:8px 0;text-align:right;color:#34d399;font-weight:600">− ${fmtCents(totalPaid)}</td>
+      </tr>` : ''}
+      <tr style="border-top:2px solid #FF6600">
+        <td style="padding:14px 0;font-size:18px;font-weight:800;color:#fff">Balance Due</td>
+        <td style="padding:14px 0;text-align:right;font-size:22px;font-weight:800;color:${isPaid ? '#34d399' : '#FF6600'}">
+          ${isPaid ? 'PAID' : fmtCents(balance)}
+        </td>
+      </tr>
+    </table>
+  </div>
+
+  ${invoiceData.customer_note ? `
+  <div style="padding:20px;background:#2D2D2D;border-radius:8px;margin-bottom:40px">
+    <p style="font-size:11px;font-weight:700;letter-spacing:0.1em;text-transform:uppercase;color:#C0C0C0;margin-bottom:8px">NOTES</p>
+    <p style="color:#fff;line-height:1.6">${invoiceData.customer_note}</p>
+  </div>` : ''}
+
+  ${!isPaid ? `
+  <!-- Pay CTA -->
+  <div style="background:#FF6600;border-radius:12px;padding:32px;text-align:center">
+    <p style="color:#fff;font-size:18px;font-weight:800;margin-bottom:8px">Balance due: ${fmtCents(balance)}</p>
+    <p style="color:rgba(255,255,255,0.85);font-size:14px;margin-bottom:20px">Pay securely online — takes less than a minute</p>
+    <a href="${paymentUrl}" style="display:inline-block;background:#fff;color:#FF6600;padding:14px 36px;border-radius:8px;text-decoration:none;font-weight:800;font-size:16px">
+      Pay Now — ${fmtCents(balance)}
+    </a>
+    <p style="color:rgba(255,255,255,0.6);font-size:12px;margin-top:16px">Powered by Stripe — 100% secure</p>
+  </div>` : `
+  <!-- Paid confirmation -->
+  <div style="background:#1a3d2e;border:1px solid #166046;border-radius:12px;padding:24px;text-align:center">
+    <p style="color:#34d399;font-size:18px;font-weight:800">✓ Paid in full — thank you!</p>
+    ${invoiceData.paid_at ? `<p style="color:#C0C0C0;font-size:13px;margin-top:4px">
+      ${new Date(invoiceData.paid_at).toLocaleDateString('en-US', { month: 'long', day: 'numeric', year: 'numeric' })}
+    </p>` : ''}
+  </div>`}
+</body>
+</html>`;
+}
+
+serve(async (req) => {
+  if (req.method !== 'POST') return new Response('Method not allowed', { status: 405 });
+
+  const authHeader = req.headers.get('Authorization');
+  if (!authHeader) return new Response('Unauthorized', { status: 401 });
+  const { data: { user } } = await supabase.auth.getUser(authHeader.replace('Bearer ', ''));
+  if (!user) return new Response('Unauthorized', { status: 401 });
+
+  const { invoice_id } = await req.json() as { invoice_id: string };
+
+  // Fetch invoice + related data
+  const [invRes, paymentsRes] = await Promise.all([
+    supabase.from('invoices')
+      .select('*, customers(*), organizations(*), estimates(estimate_number)')
+      .eq('id', invoice_id).single(),
+    supabase.from('invoice_payments').select('*').eq('invoice_id', invoice_id),
+  ]);
+
+  if (!invRes.data) return new Response('Invoice not found', { status: 404 });
+
+  const invoice  = invRes.data;
+  const payments = paymentsRes.data ?? [];
+  const customer = (invoice as any).customers;
+  const org      = (invoice as any).organizations;
+  const estimate = (invoice as any).estimates ?? null;
+
+  if (!customer?.email) return new Response('Customer email required', { status: 400 });
+
+  // Auth check
+  const { data: userRow } = await supabase.from('users').select('id').eq('id', user.id).eq('org_id', invoice.org_id).single();
+  if (!userRow) return new Response('Forbidden', { status: 403 });
+
+  const totalPaid = payments.reduce((s: number, p: any) => s + (p.amount_cents ?? 0), 0);
+  const balance   = invoice.balance_cents ?? (invoice.total_cents - totalPaid);
+  const isPaid    = invoice.status === 'paid' || balance <= 0;
+
+  try {
+    let paymentUrl = invoice.payment_link_url ?? '';
+
+    // Create Stripe Payment Link if invoice is unpaid and no link exists yet
+    if (!isPaid && !invoice.payment_link_url) {
+      const price = await stripe.prices.create({
+        currency: 'usd',
+        unit_amount: balance,
+        product_data: { name: `${org.name} — Invoice ${invoice.invoice_number}` },
+      });
+      const link = await stripe.paymentLinks.create({
+        line_items: [{ price: price.id, quantity: 1 }],
+        metadata: { invoice_id, org_id: invoice.org_id },
+      });
+      paymentUrl = link.url;
+
+      await supabase.from('invoices').update({ payment_link_url: paymentUrl }).eq('id', invoice_id);
+    }
+
+    // Generate PDF
+    const html     = buildInvoiceHtml(invoice, payments, estimate, org, customer, paymentUrl);
+    const pdfBytes = await htmlToPdf(html);
+    const filename = `${invoice.invoice_number.replace(/[^a-z0-9-]/gi, '-')}.pdf`;
+    const pdfUrl   = await uploadPdf(invoice.org_id, 'invoices', filename, pdfBytes);
+
+    // Send email with PDF attachment
+    const subject = isPaid
+      ? `Receipt from ${org.name} — ${invoice.invoice_number}`
+      : `Invoice from ${org.name} — ${invoice.invoice_number}`;
+
+    await resend.emails.send({
+      from:    `${org.name} <invoices@mail.tradesuite.com>`,
+      to:      [customer.email],
+      subject,
+      html: `<div style="font-family:Inter,system-ui,sans-serif;background:#1A1A1A;color:#fff;padding:32px;max-width:600px;margin:0 auto">
+        <h2 style="color:#fff;margin-bottom:8px">Hi ${customer.first_name ?? 'there'},</h2>
+        ${isPaid
+          ? `<p style="color:#C0C0C0;margin-bottom:24px">Thank you for your payment! Your receipt is attached.</p>`
+          : `<p style="color:#C0C0C0;margin-bottom:24px">Your invoice is attached. The balance due is <strong style="color:#FF6600">${fmtCents(balance)}</strong>.</p>
+             <a href="${paymentUrl}" style="display:inline-block;background:#FF6600;color:#fff;padding:14px 32px;border-radius:8px;text-decoration:none;font-weight:700;font-size:16px;margin-bottom:24px">Pay Now</a>`
+        }
+        <p style="color:#6b6b6b;font-size:13px">— ${org.name}</p>
+      </div>`,
+      attachments: [{
+        filename,
+        content: btoa(String.fromCharCode(...pdfBytes)),
+      }],
+    });
+
+    // Update invoice sent status
+    if (!isPaid) {
+      await supabase.from('invoices').update({
+        status:  'sent',
+        sent_at: new Date().toISOString(),
+        sent_via: 'email',
+      }).eq('id', invoice_id).eq('status', 'draft');
+    }
+
+    return new Response(JSON.stringify({ pdf_url: pdfUrl, payment_link_url: paymentUrl }), {
+      headers: { 'Content-Type': 'application/json' },
+    });
+  } catch (err) {
+    console.error('omnibid-send-invoice error:', err);
+    return new Response(JSON.stringify({ error: (err as Error).message }), {
+      status: 500, headers: { 'Content-Type': 'application/json' },
+    });
+  }
+});
+```
+
+Deploy:
+```bash
+supabase functions deploy omnibid-send-invoice
+```
+
+---
+
+## TASK 5 — Add `sendInvoice` to OmniBid hooks
+
+Open `modules/estimates/src/hooks/useEstimates.ts` and add this to `useEstimateActions`:
+
+```typescript
+const sendInvoice = useCallback(async (invoiceId: string) => {
+  const { data: { session } } = await supabase.auth.getSession();
+  const res = await fetch(
+    `${(import.meta as any).env.VITE_SUPABASE_URL}/functions/v1/omnibid-send-invoice`,
+    {
+      method: 'POST',
+      headers: {
+        'Authorization': `Bearer ${session?.access_token}`,
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify({ invoice_id: invoiceId }),
+    }
+  );
+  if (!res.ok) throw new Error(await res.text());
+  return res.json() as Promise<{ pdf_url: string; payment_link_url: string }>;
+}, []);
+```
+
+Export it from the return value of `useEstimateActions`.
+
+---
+
+## TASK 6 — Add `PDF_API_URL` and `STRIPE_WEBHOOK_SECRET` to environment docs
+
+Update `.env.example` or the env documentation at the repo root to include:
 
 ```bash
-# PWA app
-pnpm --filter @trades-saas/pwa add date-fns @powersync/react
+# PDF generation (Gotenberg)
+# Dev: use https://demo.gotenberg.dev (rate-limited, do not use in production)
+# Prod: deploy Gotenberg to Railway/Fly.io — docker image: gotenberg/gotenberg:8
+PDF_API_URL=https://demo.gotenberg.dev
 
-# modules/leads
-pnpm --filter @trades-saas/leads add \
-  @trades-saas/core-types @trades-saas/core-auth \
-  @trades-saas/core-sync @trades-saas/core-ui date-fns
+# Stripe webhook signing secret (from Stripe dashboard → Webhooks → signing secret)
+STRIPE_WEBHOOK_SECRET=whsec_...
+```
 
-# modules/estimates
-pnpm --filter @trades-saas/estimates add \
-  @trades-saas/core-types @trades-saas/core-auth \
-  @trades-saas/core-sync @trades-saas/core-ui date-fns
-
-# modules/reviews
-pnpm --filter @trades-saas/reviews add \
-  @trades-saas/core-types @trades-saas/core-auth \
-  @trades-saas/core-sync @trades-saas/core-ui
-
-# Inngest + AI (workspace root for server-side use)
-pnpm add -w inngest @anthropic-ai/sdk
-
-# Verify clean install
-pnpm install
+Also add `PDF_API_URL` and `STRIPE_WEBHOOK_SECRET` as secrets for the relevant Edge Functions:
+```bash
+supabase secrets set PDF_API_URL=https://demo.gotenberg.dev
+supabase secrets set STRIPE_WEBHOOK_SECRET=whsec_...
 ```
 
 ---
 
-## TASK 4 — Create Inngest client
+## TASK 7 — Add review_requests to AppSchema and sync rules
 
-`inngest/client.ts`:
+### 7a. Open `packages/core-sync/src/schema.ts`
+
+Check if `review_requests` is already in `AppSchema`. If not, add it:
+
 ```typescript
-import { Inngest } from 'inngest';
-export const inngest = new Inngest({ id: 'tradesuite', name: 'TradeSuite' });
+const review_requests = new Table(
+  {
+    org_id:      column.text,
+    job_id:      column.text,
+    customer_id: column.text,
+    status:      column.text,
+    sent_via:    column.text,
+    platform:    column.text,
+    review_url:  column.text,
+    sent_at:     column.text,
+    clicked_at:  column.text,
+    reviewed_at: column.text,
+    star_rating: column.integer,
+    review_text: column.text,
+    inngest_run_id: column.text,
+    created_at:  column.text,
+    updated_at:  column.text,
+  },
+  { indexes: { by_status: ['status', 'created_at'] } }
+);
+
+// Add to AppSchema export:
+// review_requests,
+```
+
+### 7b. Open `packages/core-sync/sync-rules.yaml`
+
+Verify `review_requests` is present. If not, add:
+```yaml
+- SELECT * FROM review_requests WHERE org_id = bucket.org_id
 ```
 
 ---
 
-## TASK 5 — Build LeadLock module (`modules/leads/`)
+## TASK 8 — Wire RepuGuard trigger on job completion
 
-### package.json
-```json
-{
-  "name": "@trades-saas/leads",
-  "displayName": "LeadLock",
-  "version": "0.0.1",
-  "private": true,
-  "main": "./src/index.ts",
-  "scripts": { "type-check": "tsc --noEmit", "build": "echo stub" },
-  "dependencies": {
-    "@trades-saas/core-types": "workspace:*",
-    "@trades-saas/core-auth":  "workspace:*",
-    "@trades-saas/core-sync":  "workspace:*",
-    "@trades-saas/core-ui":    "workspace:*",
-    "date-fns": "^3.0.0"
-  },
-  "peerDependencies": { "react": "^18.0.0" }
-}
-```
+When a job is marked complete in the app, we need to fire the `repuguard/job.completed` Inngest event. Find `apps/pwa/src/pages/JobDetailPage.tsx` and locate where job status is updated to `'complete'` or `'closed'`.
 
-### tsconfig.json
-```json
-{
-  "extends": "../../tsconfig.base.json",
-  "compilerOptions": { "outDir": "./dist", "rootDir": "./src", "jsx": "react-jsx" },
-  "include": ["src/**/*"]
-}
-```
+After the Supabase update call that changes status to complete, add:
 
-### src/types.ts
 ```typescript
-export type LeadStatus     = 'new' | 'contacted' | 'replied' | 'booked' | 'lost';
-export type LeadSource     = 'missed_call' | 'web_form' | 'manual';
-export type SequenceStatus = 'active' | 'paused' | 'completed' | 'cancelled';
-export type MessageDirection = 'outbound' | 'inbound';
-export type MessageStatus  = 'queued' | 'sent' | 'delivered' | 'failed';
-
-export interface Lead {
-  id: string; org_id: string; phone: string; name: string | null;
-  source: LeadSource; status: LeadStatus; call_sid: string | null;
-  called_number: string | null; missed_at: string; replied_at: string | null;
-  created_at: string; updated_at: string;
+// Fire RepuGuard review sequence via Inngest
+if (newStatus === 'complete' || newStatus === 'closed') {
+  const { data: { session } } = await supabase.auth.getSession();
+  fetch(
+    `${import.meta.env.VITE_SUPABASE_URL}/functions/v1/trigger-repuguard`,
+    {
+      method: 'POST',
+      headers: {
+        'Authorization': `Bearer ${session?.access_token}`,
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify({
+        job_id:      job.id,
+        customer_id: job.customer_id,
+        org_id:      job.org_id,
+      }),
+    }
+  ).catch(console.error); // fire-and-forget
 }
-
-export interface LeadSequence {
-  id: string; org_id: string; lead_id: string; status: SequenceStatus;
-  current_step: number; inngest_run_id: string | null;
-  created_at: string; updated_at: string;
-}
-
-export interface LeadMessage {
-  id: string; org_id: string; lead_id: string; sequence_id: string | null;
-  direction: MessageDirection; body: string; status: MessageStatus;
-  telnyx_msg_id: string | null; sequence_step: number | null;
-  sent_at: string; created_at: string;
-}
-
-export interface LeadWithContext extends Lead {
-  seq_id: string | null; seq_status: SequenceStatus | null;
-  seq_current_step: number | null; last_message_body: string | null;
-  last_message_direction: MessageDirection | null; last_message_sent_at: string | null;
-  message_count: number;
-}
-
-export const SEQUENCE_STEPS = [
-  { step: 0, label: 'Immediate text-back',  delay_ms: 0 },
-  { step: 1, label: '24-hour follow-up',    delay_ms: 86400000 },
-  { step: 2, label: '48-hour final touch',  delay_ms: 172800000 },
-] as const;
 ```
 
-### src/schema.ts
+Create `supabase/functions/trigger-repuguard/index.ts` to receive this and fire the Inngest event:
+
 ```typescript
-import { column, Table } from '@powersync/web';
+import { serve }        from 'https://deno.land/std@0.177.0/http/server.ts';
+import { createClient } from 'https://esm.sh/@supabase/supabase-js@2';
 
-export const leadsTable = new Table(
-  {
-    org_id: column.text, phone: column.text, name: column.text,
-    source: column.text, status: column.text, call_sid: column.text,
-    called_number: column.text, missed_at: column.text, replied_at: column.text,
-    created_at: column.text, updated_at: column.text,
-  },
-  { indexes: { by_status: ['status', 'missed_at'] } }
-);
+const supabase = createClient(Deno.env.get('SUPABASE_URL')!, Deno.env.get('SUPABASE_SERVICE_ROLE_KEY')!);
 
-export const leadSequencesTable = new Table({
-  org_id: column.text, lead_id: column.text, status: column.text,
-  current_step: column.integer, inngest_run_id: column.text,
-  created_at: column.text, updated_at: column.text,
-});
+serve(async (req) => {
+  if (req.method !== 'POST') return new Response('Method not allowed', { status: 405 });
 
-export const leadMessagesTable = new Table(
-  {
-    org_id: column.text, lead_id: column.text, sequence_id: column.text,
-    direction: column.text, body: column.text, status: column.text,
-    telnyx_msg_id: column.text, sequence_step: column.integer,
-    sent_at: column.text, created_at: column.text,
-  },
-  { indexes: { by_lead: ['lead_id', 'sent_at'] } }
-);
-```
+  const authHeader = req.headers.get('Authorization');
+  if (!authHeader) return new Response('Unauthorized', { status: 401 });
+  const { data: { user } } = await supabase.auth.getUser(authHeader.replace('Bearer ', ''));
+  if (!user) return new Response('Unauthorized', { status: 401 });
 
-After creating `src/schema.ts`, open `packages/core-sync/src/schema.ts` and add `leads`, `lead_sequences`, `lead_messages` to the `AppSchema` export object using these table definitions.
+  const { job_id, customer_id, org_id } = await req.json() as {
+    job_id: string; customer_id: string; org_id: string;
+  };
 
-### src/hooks/useLeads.ts
-```typescript
-import { useQuery } from '@powersync/react';
-import { useCallback } from 'react';
-import { getSupabaseClient } from '@trades-saas/core-auth';
-import type { Lead, LeadMessage, LeadSequence, LeadStatus, LeadWithContext } from '../types';
+  // Verify org has RepuGuard active
+  const { data: org } = await supabase
+    .from('organizations')
+    .select('active_modules, review_delay_hours')
+    .eq('id', org_id).single();
 
-const supabase = getSupabaseClient();
-
-export function useLeads(filter?: LeadStatus) {
-  const where = filter ? `WHERE l.status = '${filter}'` : '';
-  return useQuery<LeadWithContext>(`
-    SELECT l.*,
-      s.id AS seq_id, s.status AS seq_status, s.current_step AS seq_current_step,
-      m.body AS last_message_body, m.direction AS last_message_direction,
-      m.sent_at AS last_message_sent_at,
-      (SELECT COUNT(*) FROM lead_messages WHERE lead_id = l.id) AS message_count
-    FROM leads l
-    LEFT JOIN lead_sequences s ON s.lead_id = l.id
-    LEFT JOIN lead_messages m ON m.id = (
-      SELECT id FROM lead_messages WHERE lead_id = l.id ORDER BY sent_at DESC LIMIT 1
-    )
-    ${where}
-    ORDER BY l.missed_at DESC
-  `);
-}
-
-export function useLead(leadId: string) {
-  return useQuery<Lead>('SELECT * FROM leads WHERE id = ? LIMIT 1', [leadId]);
-}
-
-export function useLeadSequence(leadId: string) {
-  return useQuery<LeadSequence>('SELECT * FROM lead_sequences WHERE lead_id = ? LIMIT 1', [leadId]);
-}
-
-export function useLeadMessages(leadId: string) {
-  return useQuery<LeadMessage>(
-    'SELECT * FROM lead_messages WHERE lead_id = ? ORDER BY sent_at ASC', [leadId]
-  );
-}
-
-export function useLeadStats() {
-  const { data } = useQuery<{ total: number; new_today: number; replied: number; booked: number }>(`
-    SELECT COUNT(*) AS total,
-      COUNT(CASE WHEN date(missed_at) = date('now') THEN 1 END) AS new_today,
-      COUNT(CASE WHEN status = 'replied' THEN 1 END) AS replied,
-      COUNT(CASE WHEN status = 'booked'  THEN 1 END) AS booked
-    FROM leads WHERE status != 'lost'
-  `);
-  return data?.[0] ?? { total: 0, new_today: 0, replied: 0, booked: 0 };
-}
-
-export function useLeadActions() {
-  const updateStatus = useCallback(async (leadId: string, status: LeadStatus) => {
-    const { error } = await supabase.from('leads').update({ status }).eq('id', leadId);
-    if (error) throw error;
-  }, []);
-
-  const pauseSequence = useCallback(async (sequenceId: string) => {
-    const { error } = await supabase.from('lead_sequences').update({ status: 'paused' }).eq('id', sequenceId);
-    if (error) throw error;
-  }, []);
-
-  const resumeSequence = useCallback(async (sequenceId: string) => {
-    const { error } = await supabase.from('lead_sequences').update({ status: 'active' }).eq('id', sequenceId);
-    if (error) throw error;
-  }, []);
-
-  const sendManualReply = useCallback(async (
-    leadId: string, orgId: string, toPhone: string, fromPhone: string, body: string
-  ) => {
-    const { data: { session } } = await supabase.auth.getSession();
-    const res = await fetch(
-      `${(import.meta as any).env.VITE_SUPABASE_URL}/functions/v1/leadlock-send-sms`,
-      {
-        method: 'POST',
-        headers: { 'Authorization': `Bearer ${session?.access_token}`, 'Content-Type': 'application/json' },
-        body: JSON.stringify({ lead_id: leadId, org_id: orgId, to: toPhone, from: fromPhone, body }),
-      }
-    );
-    if (!res.ok) throw new Error(await res.text());
-  }, []);
-
-  return { updateStatus, pauseSequence, resumeSequence, sendManualReply };
-}
-```
-
-### src/components/LeadCard.tsx
-```tsx
-import { formatDistanceToNow } from 'date-fns';
-import type { LeadWithContext } from '../types';
-
-const STATUS_CONFIG = {
-  new:       { label: 'New',       dot: 'bg-warning',        text: 'text-warning'        },
-  contacted: { label: 'Contacted', dot: 'bg-brand',          text: 'text-brand'          },
-  replied:   { label: 'Replied',   dot: 'bg-success',        text: 'text-success'        },
-  booked:    { label: 'Booked',    dot: 'bg-success',        text: 'text-success'        },
-  lost:      { label: 'Lost',      dot: 'bg-surface-border', text: 'text-content-muted'  },
-} as const;
-
-export function LeadCard({ lead, onClick }: { lead: LeadWithContext; onClick: (id: string) => void }) {
-  const status = STATUS_CONFIG[lead.status] ?? STATUS_CONFIG.new;
-  const missedAgo = formatDistanceToNow(new Date(lead.missed_at), { addSuffix: true });
-  const phone = lead.phone.replace(/^\+1(\d{3})(\d{3})(\d{4})$/, '($1) $2-$3');
-
-  return (
-    <button
-      onClick={() => onClick(lead.id)}
-      className="w-full text-left bg-surface-raised border border-surface-border rounded-card p-4
-                 hover:border-content-muted active:scale-[0.99] transition-all duration-150"
-    >
-      <div className="flex items-start justify-between gap-3">
-        <div className="flex-1 min-w-0">
-          <p className="font-bold text-field-sm text-content truncate">{lead.name ?? phone}</p>
-          {lead.name && <p className="font-mono text-field-xs text-content-secondary mt-0.5">{phone}</p>}
-        </div>
-        <span className={`flex items-center gap-1.5 text-field-xs font-semibold ${status.text} shrink-0`}>
-          <span className={`w-1.5 h-1.5 rounded-full ${status.dot} ${lead.status === 'new' ? 'animate-pulse' : ''}`} />
-          {status.label}
-        </span>
-      </div>
-
-      {lead.last_message_body && (
-        <p className="mt-2 text-field-xs text-content-secondary line-clamp-1">
-          {lead.last_message_direction === 'inbound' ? '← ' : '→ '}{lead.last_message_body}
-        </p>
-      )}
-
-      <div className="mt-3 flex items-center justify-between">
-        <span className="text-field-xs text-content-muted">{missedAgo}</span>
-        <div className="flex items-center gap-3">
-          {lead.message_count > 0 && (
-            <span className="text-field-xs text-content-muted">
-              {lead.message_count} msg{lead.message_count !== 1 ? 's' : ''}
-            </span>
-          )}
-          {(lead.seq_status === 'active' || lead.seq_status === 'paused') && (
-            <div className="flex items-center gap-1">
-              {[0, 1, 2].map(i => (
-                <span key={i} className={`w-1.5 h-1.5 rounded-full transition-colors ${
-                  i < (lead.seq_current_step ?? 0) ? 'bg-brand' :
-                  i === (lead.seq_current_step ?? 0) ? 'bg-brand opacity-60 animate-pulse' :
-                  'bg-surface-border'
-                }`} />
-              ))}
-              {lead.seq_status === 'paused' && <span className="ml-1 text-field-xs text-warning">paused</span>}
-            </div>
-          )}
-        </div>
-      </div>
-    </button>
-  );
-}
-```
-
-### src/components/SequenceTimeline.tsx
-```tsx
-import type { LeadSequence } from '../types';
-
-const STEPS = [
-  { step: 0, label: 'Immediate',     sublabel: 'Text sent on missed call' },
-  { step: 1, label: '24h follow-up', sublabel: 'If no reply after 1 day'  },
-  { step: 2, label: 'Final touch',   sublabel: 'If no reply after 3 days' },
-];
-
-export function SequenceTimeline({
-  sequence, onPause, onResume,
-}: { sequence: LeadSequence | null; onPause: () => void; onResume: () => void }) {
-  if (!sequence) return (
-    <div className="rounded-card border border-surface-border bg-surface-raised p-4">
-      <p className="text-field-xs text-content-muted">No active sequence</p>
-    </div>
-  );
-
-  const isActive = sequence.status === 'active';
-  const isPaused = sequence.status === 'paused';
-  const isDone   = sequence.status === 'completed' || sequence.status === 'cancelled';
-  const step     = sequence.current_step;
-
-  return (
-    <div className="rounded-card border border-surface-border bg-surface-raised p-4 space-y-4">
-      <div className="flex items-center justify-between">
-        <h3 className="text-field-xs font-bold text-content-secondary uppercase tracking-widest">
-          Follow-up Sequence
-        </h3>
-        {(isActive || isPaused) && (
-          <button
-            onClick={isActive ? onPause : onResume}
-            className={`text-field-xs font-bold px-2.5 py-1 rounded transition-colors ${
-              isActive ? 'text-warning hover:bg-warning/10' : 'text-success hover:bg-success/10'
-            }`}
-          >
-            {isActive ? 'Pause' : 'Resume'}
-          </button>
-        )}
-        {isDone && <span className="text-field-xs text-content-muted capitalize">{sequence.status}</span>}
-      </div>
-
-      <div className="relative">
-        <div className="absolute left-[9px] top-3 bottom-3 w-px bg-surface-border" />
-        <div className="space-y-4">
-          {STEPS.map(({ step: s, label, sublabel }) => {
-            const sent    = s < step || isDone;
-            const current = s === step && (isActive || isPaused);
-            return (
-              <div key={s} className="flex items-start gap-3 relative">
-                <div className={`mt-0.5 w-[18px] h-[18px] rounded-full border-2 flex items-center justify-center shrink-0 z-10 ${
-                  sent ? 'bg-brand border-brand' : current ? 'bg-surface-raised border-brand' : 'bg-surface-raised border-surface-border'
-                }`}>
-                  {sent && (
-                    <svg className="w-2.5 h-2.5 text-white" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={3}>
-                      <path strokeLinecap="round" strokeLinejoin="round" d="M5 13l4 4L19 7" />
-                    </svg>
-                  )}
-                  {current && <span className={`w-2 h-2 rounded-full bg-brand ${isActive ? 'animate-pulse' : ''}`} />}
-                </div>
-                <div>
-                  <p className={`text-field-sm font-semibold ${sent ? 'text-content-secondary' : current ? 'text-content' : 'text-content-muted'}`}>
-                    {label}
-                  </p>
-                  <p className="text-field-xs text-content-muted mt-0.5">{sublabel}</p>
-                </div>
-              </div>
-            );
-          })}
-        </div>
-      </div>
-    </div>
-  );
-}
-```
-
-### src/components/MessageThread.tsx
-```tsx
-import { useState, useRef, useEffect } from 'react';
-import { format } from 'date-fns';
-import type { LeadMessage } from '../types';
-
-const STEP_LABELS: Record<number, string> = { 0: 'Auto — immediate', 1: 'Auto — 24h', 2: 'Auto — final' };
-
-export function MessageThread({
-  messages, leadPhone, onSend,
-}: { messages: LeadMessage[]; leadPhone: string; onSend: (body: string) => Promise<void> }) {
-  const [draft, setDraft]     = useState('');
-  const [sending, setSending] = useState(false);
-  const bottomRef             = useRef<HTMLDivElement>(null);
-
-  useEffect(() => { bottomRef.current?.scrollIntoView({ behavior: 'smooth' }); }, [messages.length]);
-
-  async function handleSend() {
-    const t = draft.trim();
-    if (!t || sending) return;
-    setSending(true);
-    try { await onSend(t); setDraft(''); } finally { setSending(false); }
+  if (!org?.active_modules?.includes('reviews')) {
+    return new Response(JSON.stringify({ skipped: true, reason: 'reviews module not active' }), {
+      headers: { 'Content-Type': 'application/json' },
+    });
   }
 
-  return (
-    <div className="flex flex-col h-full">
-      <div className="flex-1 overflow-y-auto p-4 space-y-3 min-h-0">
-        {messages.length === 0 && (
-          <p className="text-field-xs text-content-muted text-center py-8">No messages yet</p>
-        )}
-        {messages.map(msg => {
-          const out = msg.direction === 'outbound';
-          return (
-            <div key={msg.id} className={`flex flex-col ${out ? 'items-end' : 'items-start'}`}>
-              {out && msg.sequence_step !== null && (
-                <span className="text-[10px] text-content-muted mb-1 mr-1">
-                  {STEP_LABELS[msg.sequence_step] ?? 'Auto'}
-                </span>
-              )}
-              <div className={`max-w-[80%] rounded-2xl px-3.5 py-2.5 ${
-                out ? 'bg-brand text-white rounded-br-sm' : 'bg-surface-raised text-content rounded-bl-sm'
-              }`}>
-                <p className="text-field-sm leading-snug whitespace-pre-wrap break-words">{msg.body}</p>
-              </div>
-              <span className="text-[10px] text-content-muted mt-1">
-                {format(new Date(msg.sent_at), 'MMM d, h:mm a')}
-              </span>
-            </div>
-          );
-        })}
-        <div ref={bottomRef} />
-      </div>
+  // Fire Inngest event
+  const res = await fetch(Deno.env.get('INNGEST_EVENT_URL') ?? 'https://inn.gs/e', {
+    method: 'POST',
+    headers: {
+      'Authorization': `Bearer ${Deno.env.get('INNGEST_EVENT_KEY')}`,
+      'Content-Type': 'application/json',
+    },
+    body: JSON.stringify({
+      name: 'repuguard/job.completed',
+      data: {
+        job_id,
+        customer_id,
+        org_id,
+        delay_hours: org.review_delay_hours ?? 24,
+      },
+    }),
+  });
 
-      <div className="border-t border-surface-border p-3 flex gap-2 items-end">
-        <textarea
-          value={draft}
-          onChange={e => setDraft(e.target.value)}
-          onKeyDown={e => { if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); handleSend(); } }}
-          placeholder={`Reply to ${leadPhone}`}
-          disabled={sending}
-          rows={1}
-          className="flex-1 bg-surface-sunken text-content text-field-sm rounded-xl px-3.5 py-2.5
-                     resize-none outline-none border border-surface-border focus:border-brand
-                     placeholder:text-content-muted disabled:opacity-50 min-h-[40px] max-h-[120px]"
-        />
-        <button
-          onClick={handleSend}
-          disabled={!draft.trim() || sending}
-          className="shrink-0 w-9 h-9 rounded-xl bg-brand text-white flex items-center justify-center
-                     hover:bg-brand-mid active:scale-95 transition-all disabled:opacity-30"
-        >
-          {sending
-            ? <span className="w-4 h-4 border-2 border-white/30 border-t-white rounded-full animate-spin" />
-            : <svg className="w-4 h-4" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2.5}>
-                <path strokeLinecap="round" strokeLinejoin="round" d="M6 12L3.269 3.126A59.768 59.768 0 0121.485 12 59.77 59.77 0 013.27 20.876L5.999 12zm0 0h7.5" />
-              </svg>
-          }
-        </button>
-      </div>
-    </div>
-  );
-}
+  if (!res.ok) {
+    console.error('trigger-repuguard: Inngest error', await res.text());
+    return new Response('Inngest error', { status: 500 });
+  }
+
+  return new Response(JSON.stringify({ fired: true }), {
+    headers: { 'Content-Type': 'application/json' },
+  });
+});
 ```
 
-### src/pages/LeadsPage.tsx
+Deploy:
+```bash
+supabase functions deploy trigger-repuguard
+```
+
+---
+
+## TASK 9 — Settings: Review platform URLs
+
+Open `apps/pwa/src/pages/settings/SettingsPage.tsx`. Add a "Review Links" section (or find where org settings are edited). Add three URL inputs:
+
+```tsx
+// Inside the settings form, add a section for review links.
+// These save directly to supabase.from('organizations').update(...)
+
+// Fields to add:
+// google_review_url   — label: "Google Review Link"
+// yelp_review_url     — label: "Yelp Review Link"
+// facebook_review_url — label: "Facebook Review Link"
+// review_delay_hours  — label: "Hours after job completion to send request" (number input, default 24)
+```
+
+The save should call:
+```typescript
+await supabase.from('organizations')
+  .update({
+    google_review_url:   googleUrl || null,
+    yelp_review_url:     yelpUrl || null,
+    facebook_review_url: facebookUrl || null,
+    review_delay_hours:  delayHours,
+  })
+  .eq('id', org.id);
+```
+
+Show a toast/confirmation on save. Use the same card/input styling as the rest of the settings page.
+
+---
+
+## TASK 10 — Settings: Price book management page
+
+Create `apps/pwa/src/pages/settings/PriceBookPage.tsx`:
+
 ```tsx
 import { useState } from 'react';
 import { useNavigate } from 'react-router-dom';
-import { LeadCard } from '../components/LeadCard';
-import { useLeads, useLeadStats } from '../hooks/useLeads';
-import type { LeadStatus } from '../types';
+import { usePriceBook } from '@trades-saas/estimates';
+import { getSupabaseClient } from '@trades-saas/core-auth';
+import { useOrgId } from '@trades-saas/core-ui';   // or however orgId is accessed
 
-type Filter = 'all' | LeadStatus;
-const FILTERS: { key: Filter; label: string }[] = [
-  { key: 'all', label: 'All' }, { key: 'new', label: 'New' },
-  { key: 'contacted', label: 'Contacted' }, { key: 'replied', label: 'Replied' },
-  { key: 'booked', label: 'Booked' }, { key: 'lost', label: 'Lost' },
-];
+const supabase = getSupabaseClient();
 
-export function LeadsPage() {
+export default function PriceBookPage() {
   const navigate = useNavigate();
-  const [filter, setFilter] = useState<Filter>('all');
-  const { data: leads, isLoading } = useLeads(filter === 'all' ? undefined : filter);
-  const stats = useLeadStats();
+  const orgId    = useOrgId();
+  const { data: items } = usePriceBook();
 
-  return (
-    <div className="flex flex-col h-full bg-surface">
-      <div className="px-4 pt-6 pb-4 border-b border-surface-border">
-        <div className="flex items-baseline justify-between mb-4">
-          <div>
-            <h1 className="text-field-2xl font-extrabold text-content tracking-tight">LeadLock</h1>
-            <p className="text-field-xs text-content-secondary mt-0.5">Missed-call follow-up</p>
-          </div>
-          <div className="flex gap-4 text-right">
-            <div>
-              <p className="text-money-base font-bold text-warning">{stats.new_today}</p>
-              <p className="text-[10px] text-content-muted">today</p>
-            </div>
-            <div>
-              <p className="text-money-base font-bold text-success">{stats.replied}</p>
-              <p className="text-[10px] text-content-muted">replied</p>
-            </div>
-          </div>
-        </div>
-        <div className="flex gap-1 overflow-x-auto pb-1 -mx-4 px-4 scrollbar-none">
-          {FILTERS.map(({ key, label }) => (
-            <button key={key} onClick={() => setFilter(key)}
-              className={`shrink-0 text-field-xs font-bold px-3 py-1.5 rounded-full transition-colors ${
-                filter === key ? 'bg-brand text-white' : 'text-content-secondary hover:text-content hover:bg-surface-raised'
-              }`}
-            >{label}</button>
-          ))}
-        </div>
-      </div>
+  const [showForm, setShowForm] = useState(false);
+  const [form, setForm] = useState({
+    name: '', category: '', unit: 'each', unit_price: '', description: '',
+  });
+  const [saving, setSaving] = useState(false);
 
-      <div className="flex-1 overflow-y-auto">
-        {isLoading ? (
-          <div className="flex items-center justify-center h-40">
-            <span className="w-6 h-6 border-2 border-surface-border border-t-brand rounded-full animate-spin" />
-          </div>
-        ) : leads.length === 0 ? (
-          <div className="flex flex-col items-center justify-center h-64 px-8 text-center">
-            <p className="text-field-sm font-bold text-content-secondary">
-              {filter === 'all' ? 'No leads yet' : `No ${filter} leads`}
-            </p>
-            <p className="text-field-xs text-content-muted mt-1">
-              {filter === 'all' ? 'Leads appear when you miss a call' : 'Try a different filter'}
-            </p>
-          </div>
-        ) : (
-          <div className="p-4 space-y-2">
-            {leads.map(lead => (
-              <LeadCard key={lead.id} lead={lead} onClick={() => navigate(`/leads/${lead.id}`)} />
-            ))}
-          </div>
-        )}
-      </div>
-    </div>
-  );
-}
-```
-
-### src/pages/LeadDetailPage.tsx
-```tsx
-import { useParams, useNavigate } from 'react-router-dom';
-import { formatDistanceToNow } from 'date-fns';
-import { SequenceTimeline } from '../components/SequenceTimeline';
-import { MessageThread }    from '../components/MessageThread';
-import { useLead, useLeadMessages, useLeadSequence, useLeadActions } from '../hooks/useLeads';
-
-const STATUS_TEXT: Record<string, string> = {
-  new: 'text-warning', contacted: 'text-brand',
-  replied: 'text-success', booked: 'text-success', lost: 'text-content-muted',
-};
-
-function fmt(e164: string) { return e164.replace(/^\+1(\d{3})(\d{3})(\d{4})$/, '($1) $2-$3'); }
-
-export function LeadDetailPage() {
-  const { leadId } = useParams<{ leadId: string }>();
-  const navigate   = useNavigate();
-  const { data: leads }     = useLead(leadId!);
-  const { data: sequences } = useLeadSequence(leadId!);
-  const { data: messages }  = useLeadMessages(leadId!);
-  const { pauseSequence, resumeSequence, updateStatus, sendManualReply } = useLeadActions();
-
-  const lead = leads?.[0] ?? null;
-  const seq  = sequences?.[0] ?? null;
-
-  if (!lead) return (
-    <div className="flex items-center justify-center h-full bg-surface">
-      <span className="w-6 h-6 border-2 border-surface-border border-t-brand rounded-full animate-spin" />
-    </div>
-  );
-
-  async function handleSend(body: string) {
-    if (!lead.called_number) throw new Error('No outbound number');
-    await sendManualReply(lead.id, lead.org_id, lead.phone, lead.called_number, body);
-    if (seq?.status === 'active') await pauseSequence(seq.id);
-    if (lead.status === 'new' || lead.status === 'contacted') await updateStatus(lead.id, 'replied');
+  async function handleAdd() {
+    if (!form.name || !form.unit_price) return;
+    setSaving(true);
+    try {
+      await supabase.from('price_book').insert({
+        org_id:     orgId,
+        name:       form.name,
+        category:   form.category || null,
+        unit:       form.unit,
+        unit_price: parseFloat(form.unit_price),   // price book stores dollars
+        active:     true,
+      });
+      setForm({ name: '', category: '', unit: 'each', unit_price: '', description: '' });
+      setShowForm(false);
+    } finally {
+      setSaving(false);
+    }
   }
+
+  async function handleToggleActive(id: string, currentActive: boolean) {
+    await supabase.from('price_book').update({ active: !currentActive }).eq('id', id);
+  }
+
+  async function handleDelete(id: string) {
+    await supabase.from('price_book').delete().eq('id', id);
+  }
+
+  // Group by category
+  const grouped = items.reduce<Record<string, typeof items>>((acc, item) => {
+    const cat = item.category ?? 'Uncategorized';
+    if (!acc[cat]) acc[cat] = [];
+    acc[cat].push(item);
+    return acc;
+  }, {});
 
   return (
     <div className="flex flex-col h-full bg-surface">
       <div className="flex items-center gap-3 px-4 py-3 border-b border-surface-border">
-        <button onClick={() => navigate(-1)} className="text-content-secondary hover:text-content p-1 -ml-1">
+        <button onClick={() => navigate('/settings')} className="text-content-secondary hover:text-content p-1 -ml-1">
           <svg className="w-5 h-5" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
             <path strokeLinecap="round" strokeLinejoin="round" d="M15 19l-7-7 7-7" />
           </svg>
         </button>
-        <div className="flex-1 min-w-0">
-          <p className="text-field-sm font-bold text-content truncate">{lead.name ?? fmt(lead.phone)}</p>
-          {lead.name && <p className="text-field-xs text-content-secondary">{fmt(lead.phone)}</p>}
-        </div>
-        <span className={`text-field-xs font-bold capitalize ${STATUS_TEXT[lead.status] ?? 'text-content-secondary'}`}>
-          {lead.status}
-        </span>
+        <h1 className="text-field-lg font-extrabold text-content flex-1">Price Book</h1>
+        <button
+          onClick={() => setShowForm(true)}
+          className="text-field-xs font-bold bg-brand text-white px-3 py-2 rounded-button hover:bg-brand-mid transition-colors"
+        >
+          + Add Item
+        </button>
       </div>
 
-      <div className="flex-1 overflow-hidden flex flex-col md:flex-row min-h-0">
-        <div className="md:w-64 shrink-0 border-b md:border-b-0 md:border-r border-surface-border overflow-y-auto">
-          <div className="p-4 space-y-4">
-            <div className="space-y-2 text-field-xs">
-              <div className="flex justify-between">
-                <span className="text-content-muted">Missed</span>
-                <span className="text-content-secondary">{formatDistanceToNow(new Date(lead.missed_at), { addSuffix: true })}</span>
-              </div>
-              <div className="flex justify-between">
-                <span className="text-content-muted">Source</span>
-                <span className="text-content-secondary capitalize">{lead.source.replace('_', ' ')}</span>
-              </div>
-              {lead.replied_at && (
-                <div className="flex justify-between">
-                  <span className="text-content-muted">Replied</span>
-                  <span className="text-success">{formatDistanceToNow(new Date(lead.replied_at), { addSuffix: true })}</span>
+      <div className="flex-1 overflow-y-auto">
+        {/* Add form */}
+        {showForm && (
+          <div className="m-4 p-4 bg-surface-raised rounded-card border border-surface-border">
+            <p className="text-field-sm font-bold text-content mb-3">New Item</p>
+            <div className="space-y-2">
+              {[
+                { key: 'name', label: 'Name', placeholder: 'e.g. Install 2-ton AC unit' },
+                { key: 'category', label: 'Category', placeholder: 'e.g. HVAC, Labor, Materials' },
+                { key: 'description', label: 'Description (optional)', placeholder: '' },
+              ].map(({ key, label, placeholder }) => (
+                <div key={key}>
+                  <label className="text-field-xs text-content-muted block mb-1">{label}</label>
+                  <input
+                    value={(form as any)[key]}
+                    onChange={e => setForm(f => ({ ...f, [key]: e.target.value }))}
+                    placeholder={placeholder}
+                    className="w-full bg-surface-sunken text-content text-field-sm rounded-input px-3 py-2 border border-surface-border focus:border-brand outline-none"
+                  />
                 </div>
-              )}
-            </div>
-
-            <div>
-              <p className="text-[10px] font-bold text-content-muted uppercase tracking-widest mb-2">Mark as</p>
-              <div className="flex flex-wrap gap-1.5">
-                {(['replied', 'booked', 'lost'] as const).map(s => (
-                  <button key={s} onClick={() => updateStatus(lead.id, s)} disabled={lead.status === s}
-                    className={`text-field-xs font-bold px-2.5 py-1 rounded-full border transition-colors capitalize ${
-                      lead.status === s ? 'border-brand text-brand cursor-default' :
-                      'border-surface-border text-content-secondary hover:border-brand hover:text-brand'
-                    }`}
-                  >{s}</button>
-                ))}
+              ))}
+              <div className="flex gap-2">
+                <div className="flex-1">
+                  <label className="text-field-xs text-content-muted block mb-1">Unit</label>
+                  <select
+                    value={form.unit}
+                    onChange={e => setForm(f => ({ ...f, unit: e.target.value }))}
+                    className="w-full bg-surface-sunken text-content text-field-sm rounded-input px-3 py-2 border border-surface-border focus:border-brand outline-none"
+                  >
+                    {['each', 'hour', 'sqft', 'lnft', 'ton', 'lb', 'ft'].map(u => (
+                      <option key={u} value={u}>{u}</option>
+                    ))}
+                  </select>
+                </div>
+                <div className="flex-1">
+                  <label className="text-field-xs text-content-muted block mb-1">Price ($)</label>
+                  <input
+                    type="number"
+                    value={form.unit_price}
+                    onChange={e => setForm(f => ({ ...f, unit_price: e.target.value }))}
+                    placeholder="0.00"
+                    min="0"
+                    step="0.01"
+                    className="w-full bg-surface-sunken text-content text-field-sm font-mono rounded-input px-3 py-2 border border-surface-border focus:border-brand outline-none"
+                  />
+                </div>
               </div>
             </div>
-
-            <SequenceTimeline
-              sequence={seq}
-              onPause={() => seq && pauseSequence(seq.id)}
-              onResume={() => seq && resumeSequence(seq.id)}
-            />
+            <div className="flex gap-2 mt-3">
+              <button onClick={() => setShowForm(false)} className="flex-1 py-2 text-field-sm text-content-secondary border border-surface-border rounded-button hover:border-content-muted transition-colors">
+                Cancel
+              </button>
+              <button onClick={handleAdd} disabled={saving || !form.name || !form.unit_price}
+                className="flex-1 py-2 text-field-sm font-bold bg-brand text-white rounded-button hover:bg-brand-mid transition-colors disabled:opacity-30">
+                {saving ? 'Saving...' : 'Add Item'}
+              </button>
+            </div>
           </div>
-        </div>
+        )}
 
-        <div className="flex-1 min-h-0 flex flex-col">
-          <MessageThread messages={messages} leadPhone={fmt(lead.phone)} onSend={handleSend} />
-        </div>
+        {/* Grouped list */}
+        {Object.entries(grouped).map(([category, catItems]) => (
+          <div key={category}>
+            <p className="px-4 py-2 text-[10px] font-bold text-content-muted uppercase tracking-widest bg-surface/80 sticky top-0">
+              {category}
+            </p>
+            {catItems.map(item => (
+              <div key={item.id} className={`flex items-center gap-3 px-4 py-3 border-b border-surface-border ${!item.active ? 'opacity-40' : ''}`}>
+                <div className="flex-1 min-w-0">
+                  <p className="text-field-sm font-semibold text-content truncate">{item.name}</p>
+                  <p className="text-field-xs text-content-muted">
+                    ${item.unit_price.toFixed(2)} / {item.unit}
+                  </p>
+                </div>
+                <button onClick={() => handleToggleActive(item.id, !!item.active)}
+                  className="text-field-xs text-content-muted hover:text-content px-2 py-1 rounded transition-colors">
+                  {item.active ? 'Hide' : 'Show'}
+                </button>
+                <button onClick={() => handleDelete(item.id)}
+                  className="text-field-xs text-danger hover:text-red-300 px-2 py-1 rounded transition-colors">
+                  Delete
+                </button>
+              </div>
+            ))}
+          </div>
+        ))}
+
+        {items.length === 0 && !showForm && (
+          <div className="flex flex-col items-center justify-center h-64 text-center px-8">
+            <p className="text-field-sm font-bold text-content-secondary">No items yet</p>
+            <p className="text-field-xs text-content-muted mt-1">Add your services and materials above</p>
+          </div>
+        )}
       </div>
     </div>
   );
 }
 ```
 
-### src/index.ts
-```typescript
-export * from './types';
-export * from './hooks/useLeads';
-export { LeadCard }         from './components/LeadCard';
-export { SequenceTimeline } from './components/SequenceTimeline';
-export { MessageThread }    from './components/MessageThread';
-export { LeadsPage }        from './pages/LeadsPage';
-export { LeadDetailPage }   from './pages/LeadDetailPage';
-```
-
-### Update `apps/pwa/src/pages/LeadsPage.tsx`
-```typescript
-export { LeadsPage as default } from '@trades-saas/leads';
-```
-
-### Add `/leads/:leadId` route to `apps/pwa/src/App.tsx`
-Find the existing `/leads` route and add below it:
+Add route to `apps/pwa/src/App.tsx`:
 ```tsx
-const LeadDetailPage = lazy(() =>
-  import('@trades-saas/leads').then(m => ({ default: m.LeadDetailPage }))
-);
-// In <Routes>:
-<Route path="/leads/:leadId" element={<LeadDetailPage />} />
+const PriceBookPage = lazy(() => import('./pages/settings/PriceBookPage'));
+// Add route inside AuthenticatedShell:
+<Route path="/settings/price-book" element={<PriceBookPage />} />
+```
+
+Add link in `SettingsPage.tsx` (find the settings menu list and add):
+```tsx
+{ label: 'Price Book', path: '/settings/price-book', icon: '📋' }
 ```
 
 ---
 
-## TASK 6 — LeadLock migration
+## TASK 11 — Add Inngest event key secret
 
-Create `supabase/migrations/20260514_leadlock.sql`:
+The `trigger-repuguard` function and `stripe-webhook` both need `INNGEST_EVENT_KEY` and `INNGEST_EVENT_URL`:
+```bash
+supabase secrets set INNGEST_EVENT_KEY=your-inngest-event-key
+supabase secrets set INNGEST_EVENT_URL=https://inn.gs/e
+```
 
-```sql
-ALTER TABLE public.organizations
-  ADD COLUMN IF NOT EXISTS telnyx_number    text,
-  ADD COLUMN IF NOT EXISTS owner_first_name text,
-  ADD COLUMN IF NOT EXISTS trade            text DEFAULT 'home services';
-
-CREATE UNIQUE INDEX IF NOT EXISTS orgs_telnyx_number_unique
-  ON public.organizations (telnyx_number) WHERE telnyx_number IS NOT NULL;
-
-CREATE TABLE IF NOT EXISTS public.leads (
-  id            uuid PRIMARY KEY DEFAULT gen_random_uuid(),
-  org_id        uuid NOT NULL REFERENCES public.organizations(id) ON DELETE CASCADE,
-  phone         text NOT NULL,
-  name          text,
-  source        text NOT NULL DEFAULT 'missed_call',
-  status        text NOT NULL DEFAULT 'new',
-  call_sid      text,
-  called_number text,
-  missed_at     timestamptz NOT NULL DEFAULT now(),
-  replied_at    timestamptz,
-  created_at    timestamptz NOT NULL DEFAULT now(),
-  updated_at    timestamptz NOT NULL DEFAULT now()
-);
-
-CREATE TABLE IF NOT EXISTS public.lead_sequences (
-  id             uuid PRIMARY KEY DEFAULT gen_random_uuid(),
-  org_id         uuid NOT NULL REFERENCES public.organizations(id) ON DELETE CASCADE,
-  lead_id        uuid NOT NULL REFERENCES public.leads(id) ON DELETE CASCADE,
-  status         text NOT NULL DEFAULT 'active',
-  current_step   int  NOT NULL DEFAULT 0,
-  inngest_run_id text,
-  created_at     timestamptz NOT NULL DEFAULT now(),
-  updated_at     timestamptz NOT NULL DEFAULT now(),
-  UNIQUE (lead_id)
-);
-
-CREATE TABLE IF NOT EXISTS public.lead_messages (
-  id            uuid PRIMARY KEY DEFAULT gen_random_uuid(),
-  org_id        uuid NOT NULL REFERENCES public.organizations(id) ON DELETE CASCADE,
-  lead_id       uuid NOT NULL REFERENCES public.leads(id) ON DELETE CASCADE,
-  sequence_id   uuid REFERENCES public.lead_sequences(id),
-  direction     text NOT NULL,
-  body          text NOT NULL,
-  status        text NOT NULL DEFAULT 'sent',
-  telnyx_msg_id text,
-  sequence_step int,
-  sent_at       timestamptz NOT NULL DEFAULT now(),
-  created_at    timestamptz NOT NULL DEFAULT now()
-);
-
-CREATE TRIGGER leads_updated_at
-  BEFORE UPDATE ON public.leads FOR EACH ROW EXECUTE FUNCTION public.set_updated_at();
-CREATE TRIGGER lead_sequences_updated_at
-  BEFORE UPDATE ON public.lead_sequences FOR EACH ROW EXECUTE FUNCTION public.set_updated_at();
-
-CREATE INDEX ON public.leads         (org_id, status, missed_at DESC);
-CREATE INDEX ON public.lead_messages (lead_id, sent_at DESC);
-
-ALTER TABLE public.leads          ENABLE ROW LEVEL SECURITY;
-ALTER TABLE public.lead_sequences ENABLE ROW LEVEL SECURITY;
-ALTER TABLE public.lead_messages  ENABLE ROW LEVEL SECURITY;
-
-CREATE POLICY "leads_org"          ON public.leads
-  USING (org_id = (SELECT org_id FROM public.org_members WHERE user_id = auth.uid() LIMIT 1));
-CREATE POLICY "lead_sequences_org" ON public.lead_sequences
-  USING (org_id = (SELECT org_id FROM public.org_members WHERE user_id = auth.uid() LIMIT 1));
-CREATE POLICY "lead_messages_org"  ON public.lead_messages
-  USING (org_id = (SELECT org_id FROM public.org_members WHERE user_id = auth.uid() LIMIT 1));
-
-CREATE POLICY "leads_service"          ON public.leads          TO service_role USING (true) WITH CHECK (true);
-CREATE POLICY "lead_sequences_service" ON public.lead_sequences TO service_role USING (true) WITH CHECK (true);
-CREATE POLICY "lead_messages_service"  ON public.lead_messages  TO service_role USING (true) WITH CHECK (true);
-
-ALTER PUBLICATION supabase_realtime ADD TABLE public.leads;
-ALTER PUBLICATION supabase_realtime ADD TABLE public.lead_messages;
+Verify `inngest/serve.ts` has `INNGEST_SIGNING_KEY` set in its environment:
+```bash
+# In the Railway/Fly deployment env vars:
+INNGEST_SIGNING_KEY=signkey-prod-...
+INNGEST_EVENT_KEY=...
+SUPABASE_URL=...
+SUPABASE_SERVICE_ROLE_KEY=...
+ANTHROPIC_API_KEY=...
+RESEND_API_KEY=...
+TELNYX_API_KEY=...
 ```
 
 ---
 
-## TASK 7 — LeadLock Edge Function
+## TASK 12 — Add inngest/package.json for the serve server
 
-Create `supabase/functions/telnyx-webhook/index.ts`.
+Check if `inngest/package.json` exists. If not, create it:
 
-Implementation requirements:
-- Deno runtime — all imports from `https://esm.sh/` or `https://deno.land/`
-- Verify Ed25519 signature using `telnyx-signature-ed25519` and `telnyx-timestamp` headers against `TELNYX_PUBLIC_KEY` env var
-- Handle `call.hangup`: upsert lead on `(org_id, phone)` conflict, upsert `lead_sequences`, send `leadlock/lead.created` Inngest event
-- Handle `message.received`: insert `lead_messages` row, update lead status to `replied`, update sequence status to `cancelled`, send `leadlock/lead.replied` Inngest event
-- Resolve `org_id` by looking up `telnyx_number` on `organizations` table
-- Always return HTTP 200 for recognized events
+```json
+{
+  "name": "@trades-saas/inngest-server",
+  "version": "0.0.1",
+  "private": true,
+  "main": "serve.ts",
+  "scripts": {
+    "dev":   "tsx watch serve.ts",
+    "start": "tsx serve.ts",
+    "build": "tsc"
+  },
+  "dependencies": {
+    "@anthropic-ai/sdk":    "^0.24.0",
+    "@supabase/supabase-js": "^2.0.0",
+    "express":              "^4.18.0",
+    "inngest":              "^4.0.0",
+    "resend":               "^3.0.0"
+  },
+  "devDependencies": {
+    "@types/express": "^4.17.0",
+    "tsx":            "^4.0.0",
+    "typescript":     "^5.4.0"
+  }
+}
+```
 
----
-
-## TASK 8 — LeadLock Inngest sequence
-
-Create `inngest/functions/leadlock-sequence.ts`.
-
-Implementation requirements:
-- Triggered by `leadlock/lead.created`
-- Import `inngest` from `../../inngest/client`
-- Step 0: Call Claude Sonnet (`claude-sonnet-4-20250514`) to generate SMS under 160 chars, no emojis, GSM-7 only. Send via Telnyx REST API (`POST https://api.telnyx.com/v2/messages`). Insert into `lead_messages`. Update lead status to `contacted`.
-- `step.waitForEvent('leadlock/lead.replied', { match: 'data.lead_id', timeout: '24h' })` — if received, mark sequence `completed` and return
-- Step 1: Check sequence status (may have been paused/cancelled). If still `active`, generate + send 24h follow-up
-- `step.waitForEvent` with `timeout: '48h'` — if received, mark completed and return
-- Step 2: Check sequence status. If still `active`, generate + send final touch, mark lead `lost` (only if status is still `contacted`), mark sequence `completed`
-
-Claude system prompt for SMS generation: contractor's trade, business name, and `owner_first_name` come from the `organizations` table. Messages must be warm and specific to the missed call, not generic.
-
----
-
-## TASK 9 — Add LeadLock to PowerSync sync rules
-
-Open `packages/core-sync/sync-rules.yaml` and add to the existing org data bucket's `data:` section:
-
-```yaml
-- SELECT * FROM leads          WHERE org_id = bucket.org_id
-- SELECT * FROM lead_sequences WHERE org_id = bucket.org_id
-- SELECT * FROM lead_messages
-  WHERE org_id = bucket.org_id
-    AND sent_at > now() - interval '90 days'
+Also verify `inngest/tsconfig.json` exists:
+```json
+{
+  "extends": "../tsconfig.base.json",
+  "compilerOptions": {
+    "module": "CommonJS",
+    "outDir": "./dist",
+    "rootDir": "."
+  },
+  "include": ["./**/*.ts"]
+}
 ```
 
 ---
 
-## TASK 10 — OmniBid module (`modules/estimates/`)
+## TASK 13 — PWA icons
 
-Check `packages/core-sync/src/schema.ts` first — `estimates`, `estimate_line_items`, `invoices`, `invoice_payments` may already exist. Do not recreate them.
+The `vite.config.ts` PWA manifest references `/icons/icon-192.png` and `/icons/icon-512.png`.
+Create `apps/pwa/public/icons/` directory.
 
-Build the module following the same pattern as LeadLock:
-- `package.json` — name: `@trades-saas/estimates`, displayName: `OmniBid`
-- `src/types.ts` — monetary values in cents (`_cents` suffix)
-- `src/hooks/useEstimates.ts` — `useEstimates`, `useEstimate`, `useEstimateItems`, `usePriceBook`, `useEstimateStats`, `useEstimateActions`
-- `src/components/PriceBookPicker.tsx` — full-screen modal, search, grouped by category
-- `src/components/VoiceButton.tsx` — hold to record via MediaRecorder, release to send to Edge Function
-- `src/components/LineItemRow.tsx` — editable when draft, read-only otherwise
-- `src/pages/EstimatesPage.tsx` — list with filter tabs, stats row, new button
-- `src/pages/EstimateDetailPage.tsx` — voice button, line items, price book picker, totals, send button
+Generate two placeholder PNG icons programmatically — an orange square (`#FF6600`) with a white "TS" text. Use a canvas-based script or create simple colored PNG placeholders.
 
-Create `supabase/migrations/20260514_omnibid_pricebook.sql` for the `price_book` table (if not already in schema).
+The simplest approach: create a Node script at `scripts/generate-icons.mjs`:
+```javascript
+import { createCanvas } from 'canvas';
+import { writeFileSync, mkdirSync } from 'fs';
 
-Create `supabase/functions/omnibid-voice-parse/index.ts`:
-- Accepts multipart: `audio` blob + `org_id`
-- Gemini Flash transcription → Claude Sonnet structuring → return JSON
+function makeIcon(size) {
+  const canvas = createCanvas(size, size);
+  const ctx    = canvas.getContext('2d');
+  // Background
+  ctx.fillStyle = '#FF6600';
+  ctx.fillRect(0, 0, size, size);
+  // Text
+  ctx.fillStyle = '#FFFFFF';
+  ctx.font      = `bold ${Math.floor(size * 0.35)}px sans-serif`;
+  ctx.textAlign = 'center';
+  ctx.textBaseline = 'middle';
+  ctx.fillText('TS', size / 2, size / 2);
+  return canvas.toBuffer('image/png');
+}
 
-Create `supabase/functions/omnibid-send-estimate/index.ts`:
-- Fetch estimate + items + customer + org
-- Create Stripe Payment Link
-- Build HTML email, send via Resend
-- Update estimate status, fire `omnibid/estimate.sent` Inngest event
-
-Create `inngest/functions/omnibid-estimate-watcher.ts`:
-- Wait 48h for `omnibid/estimate.paid`, if not received send follow-up email
-
-Update `apps/pwa/src/pages/EstimatesPage.tsx`:
-```typescript
-export { EstimatesPage as default } from '@trades-saas/estimates';
+mkdirSync('apps/pwa/public/icons', { recursive: true });
+writeFileSync('apps/pwa/public/icons/icon-192.png', makeIcon(192));
+writeFileSync('apps/pwa/public/icons/icon-512.png', makeIcon(512));
+console.log('Icons generated.');
 ```
+
+Run:
+```bash
+pnpm add -w canvas
+node scripts/generate-icons.mjs
+```
+
+If `canvas` is unavailable in the environment, create the smallest valid PNG files manually using a data URL approach or copy any 192×192 and 512×512 PNG placeholders into the directory. The icons must exist for the PWA manifest to validate.
 
 ---
 
-## TASK 11 — RepuGuard stub (`modules/reviews/`)
-
-Update `modules/reviews/package.json` — name: `@trades-saas/reviews`, displayName: `RepuGuard`.
-
-Create `modules/reviews/src/index.ts`:
-```typescript
-export function ReviewsPage() { return null; }
-```
-
-Update `apps/pwa/src/pages/ReviewsPage.tsx`:
-```typescript
-export { ReviewsPage as default } from '@trades-saas/reviews';
-```
-
----
-
-## TASK 12 — Final checks
+## TASK 14 — Final checks
 
 ```bash
+# Install all deps
 pnpm install
-pnpm turbo typecheck
-```
 
-Fix all type errors. Then confirm these files exist and are non-empty:
-- `modules/leads/src/pages/LeadsPage.tsx`
-- `modules/leads/src/pages/LeadDetailPage.tsx`
-- `modules/estimates/src/pages/EstimatesPage.tsx`
-- `modules/estimates/src/pages/EstimateDetailPage.tsx`
-- `supabase/migrations/20260514_leadlock.sql`
-- `supabase/functions/telnyx-webhook/index.ts`
-- `supabase/functions/omnibid-voice-parse/index.ts`
-- `supabase/functions/omnibid-send-estimate/index.ts`
-- `inngest/client.ts`
-- `inngest/functions/leadlock-sequence.ts`
-- `inngest/functions/omnibid-estimate-watcher.ts`
-- `packages/core-ui/src/tokens/index.ts` — must contain `#FF6600` and `#1A1A1A`
-- `apps/pwa/src/styles.css` — must contain `color-scheme: dark`
-- `apps/pwa/index.html` — must contain `Inter` and `#FF6600`
+# Type-check everything — fix all errors before finishing
+pnpm turbo typecheck
+
+# Verify new files exist:
+ls -la supabase/functions/_shared/pdf.ts
+ls -la supabase/functions/omnibid-send-invoice/index.ts
+ls -la supabase/functions/trigger-repuguard/index.ts
+ls -la apps/pwa/src/pages/settings/PriceBookPage.tsx
+ls -la apps/pwa/public/icons/icon-192.png
+ls -la apps/pwa/public/icons/icon-512.png
+ls -la supabase/migrations/20260516_storage_documents.sql
+ls -la inngest/package.json
+
+# Verify PDF env var is documented:
+grep -r "PDF_API_URL" supabase/functions/
+
+# Verify review_requests in AppSchema:
+grep -r "review_requests" packages/core-sync/src/schema.ts
+
+# Deploy all new/updated Edge Functions:
+supabase functions deploy omnibid-send-estimate
+supabase functions deploy omnibid-send-invoice
+supabase functions deploy trigger-repuguard
+
+# Set required secrets:
+supabase secrets set PDF_API_URL=https://demo.gotenberg.dev
+supabase secrets set STRIPE_WEBHOOK_SECRET=whsec_...
+supabase secrets set INNGEST_EVENT_KEY=...
+supabase secrets set INNGEST_EVENT_URL=https://inn.gs/e
+```
 
 ---
 
-## HARD RULES
+## HARD RULES REMINDER
 
-- `@trades-saas/` prefix only — never `@acme/`
-- Vite + React only — no Next.js patterns
+- Package prefix: `@trades-saas/` only
 - Font: Inter only — no Sora, no DM Mono
-- Colors: Tailwind token classes only (`bg-brand`, `bg-surface`, `text-content`) — no hex in components
-- Reads: PowerSync `useQuery` — never `supabase.from().select()` in components
-- Money: cents in DB, dollars in display
-- `set_updated_at()` already exists — never redefine it
+- Colors: token classes only — no hex in components
+- Reads: PowerSync `useQuery` only — never `supabase.from().select()` in components
+- Money: cents in DB, dollar display via `toLocaleString`
 - Edge Functions: Deno — `https://esm.sh/` imports only
-- Touch targets: 48px minimum (`h-touch`)
+- Touch targets: 48px minimum
+- `set_updated_at()` already exists — never redefine it
