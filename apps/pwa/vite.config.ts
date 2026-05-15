@@ -42,10 +42,21 @@ export default defineConfig({
       },
 
       workbox: {
-        // App shell — cache first (works offline immediately)
-        globPatterns: ['**/*.{js,css,html,ico,png,svg,wasm}'],
+        // App shell — cache first (works offline immediately).
+        // WASM files are excluded here (>2 MB, over Workbox precache limit)
+        // and handled by a CacheFirst runtime rule below instead.
+        globPatterns: ['**/*.{js,css,html,ico,png,svg}'],
 
         runtimeCaching: [
+          {
+            // SQLite/PowerSync WASM — CacheFirst, rarely changes
+            urlPattern: /\.wasm$/,
+            handler:    'CacheFirst',
+            options: {
+              cacheName:  'wasm-cache',
+              expiration: { maxEntries: 10, maxAgeSeconds: 60 * 60 * 24 * 30 },
+            },
+          },
           {
             // Supabase API — network first, cache fallback for 5min
             urlPattern: /^https:\/\/.*\.supabase\.co\//,
@@ -99,16 +110,22 @@ export default defineConfig({
     },
   },
 
+  // Use ES module format for web workers — required for @powersync/web WASM workers.
+  // iife format (the Vite default) is incompatible with code-splitting builds.
+  worker: {
+    format: 'es',
+  },
+
   build: {
     target:   'es2020',
     rollupOptions: {
       output: {
-        // Split vendor chunks for better caching
+        // PowerSync and its WASM worker must NOT be in manualChunks — the package
+        // contains iife-format worker bundles which are incompatible with
+        // Rollup code-splitting mode. It loads its own workers via import.meta.url.
         manualChunks: {
-          'react-vendor':  ['react', 'react-dom', 'react-router-dom'],
-          'supabase':      ['@supabase/supabase-js'],
-          'powersync':     ['@powersync/web'],
-          'anthropic':     ['@anthropic-ai/sdk'],
+          'react-vendor': ['react', 'react-dom', 'react-router-dom'],
+          'supabase':     ['@supabase/supabase-js'],
         },
       },
     },
