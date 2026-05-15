@@ -16,7 +16,8 @@ import { NAV_ITEMS } from './nav';
 // ROUTE COMPONENTS (lazy-loaded for smaller initial bundle)
 // =============================================================================
 
-const LoginPage       = lazy(() => import('./pages/auth/LoginPage'));
+const LoginPage          = lazy(() => import('./pages/auth/LoginPage'));
+const ForgotPasswordPage = lazy(() => import('./pages/auth/ForgotPasswordPage'));
 const DashboardPage   = lazy(() => import('./pages/DashboardPage'));
 const JobsPage        = lazy(() => import('./pages/JobsPage'));
 const JobDetailPage   = lazy(() => import('./pages/JobDetailPage'));
@@ -101,7 +102,8 @@ export function App() {
         <Suspense fallback={<PageLoader />}>
           <Routes>
             {/* Public routes */}
-            <Route path="/auth/login" element={<LoginPage />} />
+            <Route path="/auth/login"           element={<LoginPage />} />
+            <Route path="/auth/forgot-password" element={<ForgotPasswordPage />} />
 
             {/* Redirect root → dashboard */}
             <Route path="/" element={<Navigate to="/dashboard" replace />} />
