@@ -103,5 +103,19 @@ export function useEstimateActions() {
     return res.json();
   }, []);
 
-  return { addLineItem, updateLineItem, removeLineItem, createEstimate, sendEstimate, parseVoice };
+  const sendInvoice = useCallback(async (invoiceId: string) => {
+    const { data: { session } } = await supabase.auth.getSession();
+    const res = await fetch(
+      `${(import.meta as any).env.VITE_SUPABASE_URL}/functions/v1/omnibid-send-invoice`,
+      {
+        method: 'POST',
+        headers: { 'Authorization': `Bearer ${session?.access_token}`, 'Content-Type': 'application/json' },
+        body: JSON.stringify({ invoice_id: invoiceId }),
+      }
+    );
+    if (!res.ok) throw new Error(await res.text());
+    return res.json() as Promise<{ pdf_url: string; payment_link_url: string }>;
+  }, []);
+
+  return { addLineItem, updateLineItem, removeLineItem, createEstimate, sendEstimate, sendInvoice, parseVoice };
 }

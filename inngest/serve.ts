@@ -1,3 +1,12 @@
+// Required env vars:
+//   INNGEST_SIGNING_KEY       — from Inngest dashboard (verifies webhook signatures)
+//   INNGEST_EVENT_KEY         — from Inngest dashboard (used to send events)
+//   SUPABASE_URL              — Supabase project URL
+//   SUPABASE_SERVICE_ROLE_KEY — Supabase service role secret
+//   TELNYX_API_KEY            — Telnyx API key for SMS
+//   ANTHROPIC_API_KEY         — Claude API key for AI-generated messages
+//   RESEND_API_KEY            — Resend API key for follow-up emails
+//   PORT                      — (optional) HTTP port, defaults to 3001
 import { serve } from 'inngest/express';
 import express   from 'express';
 import { inngest }                from './client';
