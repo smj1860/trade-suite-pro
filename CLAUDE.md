@@ -1,29 +1,30 @@
-# CLAUDE.md — TradeSuite Phase 3
+# CLAUDE.md — TradeSuite Phase 4
 > Execution file. Read completely then work top to bottom without pausing.
-> Phase 1 built core + LeadLock. Phase 2 built OmniBid backend, RepuGuard, and Stripe.
-> Phase 3 adds PDF generation, invoice send flow, missing triggers, settings UI, and closes all remaining gaps.
+> Phases 1-3 are confirmed complete. Phase 4 finishes the three core workflow stubs
+> and closes a handful of small bugs. After this the app is feature-complete.
 
 ---
 
 ## DO NOT RECREATE — CONFIRMED COMPLETE
 
+Every file below is confirmed in the repo. Do not touch unless a task explicitly says to.
+
 ```
 All core packages and migrations
-supabase/functions/stripe-portal/         ✓
-supabase/functions/stripe-webhook/        ✓
-supabase/functions/omnibid-voice-parse/   ✓
-supabase/functions/omnibid-send-estimate/ ✓  (needs PDF upgrade — see Task 2)
-supabase/functions/repuguard-send-request/ ✓
-inngest/serve.ts                          ✓
-inngest/functions/leadlock-sequence.ts    ✓
-inngest/functions/omnibid-estimate-watcher.ts ✓
-inngest/functions/repuguard-sequence.ts   ✓
-modules/leads/                            ✓  complete
-modules/estimates/                        ✓  complete
-modules/reviews/                          ✓  complete
-supabase/migrations/20260514_leadlock.sql ✓
-supabase/migrations/20260515_repuguard.sql ✓
-modules/estimates/supabase/migrations/0001_omnibid_schema.sql ✓
+All supabase/functions/ (stripe-portal, stripe-webhook, omnibid-*, repuguard-*, trigger-repuguard, telnyx-webhook)
+supabase/functions/_shared/pdf.ts
+inngest/ (serve.ts, client.ts, all 3 functions)
+modules/leads/          ✓ complete
+modules/estimates/      ✓ complete
+modules/reviews/        ✓ complete
+apps/pwa/src/pages/auth/LoginPage.tsx         ✓
+apps/pwa/src/pages/CalendarPage.tsx           ✓ full implementation
+apps/pwa/src/pages/DashboardPage.tsx          ✓
+apps/pwa/src/pages/settings/SettingsPage.tsx  ✓ review links + price book link
+apps/pwa/src/pages/settings/PriceBookPage.tsx ✓ full CRUD with edit + search
+apps/pwa/src/pages/settings/BillingPage.tsx   ✓
+apps/pwa/src/providers/index.tsx              ✓
+apps/pwa/src/App.tsx                          ✓ all routes wired
 ```
 
 ---
@@ -31,14 +32,14 @@ modules/estimates/supabase/migrations/0001_omnibid_schema.sql ✓
 ## HARD RULES (never break)
 
 - Package prefix: `@trades-saas/` only
-- Vite + React 18 — no Next.js patterns
+- Vite + React 18 — no Next.js
 - Font: Inter only
-- Colors: token classes only (`bg-brand`, `bg-surface`, `bg-surface-raised`, `text-content`, `text-content-secondary`, `text-content-muted`)
-- Reads: PowerSync `useQuery` — never `supabase.from().select()` in components
-- Money: cents in DB, `(cents/100).toLocaleString('en-US',{style:'currency',currency:'USD'})` in display
+- Colors: token classes only — `bg-brand`, `bg-surface`, `bg-surface-raised`, `bg-surface-sunken`, `bg-surface-border`, `text-content`, `text-content-secondary`, `text-content-muted`, `text-brand`, `text-success`, `text-warning`, `text-danger`, `text-info`
+- Reads: PowerSync `useReactiveQuery` or `useQuery` — never `supabase.from().select()` in components
+- Money: cents in DB — display with `(cents/100).toLocaleString('en-US',{style:'currency',currency:'USD'})`
 - `set_updated_at()` already exists — never redefine
-- Edge Functions: Deno — `https://esm.sh/` or `https://deno.land/` imports only
-- Touch targets: 48px minimum
+- Edge Functions: Deno — `https://esm.sh/` or `https://deno.land/` imports
+- Touch targets: 48px minimum (`h-touch`)
 
 ---
 
@@ -46,23 +47,48 @@ modules/estimates/supabase/migrations/0001_omnibid_schema.sql ✓
 
 ---
 
-## TASK 1 — Storage bucket + PDF infrastructure migration
+## TASK 1 — Fix manifest.json green theme (2 min)
 
-Create `supabase/migrations/20260516_storage_documents.sql`:
+Delete `apps/pwa/public/manifest.json` entirely.
 
+VitePWA generates the manifest automatically from `vite.config.ts` which already has the correct Safety Orange colors (`theme_color: '#FF6600'`, `background_color: '#1A1A1A'`). The static file was overriding it with the old green theme.
+
+```bash
+rm apps/pwa/public/manifest.json
+```
+
+---
+
+## TASK 2 — Fix SettingsPage review delay default (1 min)
+
+In `apps/pwa/src/pages/settings/SettingsPage.tsx`, find:
+```typescript
+const [delayHours, setDelayHours] = useState<number>((org as any)?.review_delay_hours ?? 2);
+```
+
+Change `?? 2` to `?? 24`:
+```typescript
+const [delayHours, setDelayHours] = useState<number>((org as any)?.review_delay_hours ?? 24);
+```
+
+---
+
+## TASK 3 — Verify/fix Storage bucket migration
+
+Check if `supabase/migrations/20260516_storage_documents.sql` exists:
+```bash
+ls supabase/migrations/20260516_storage_documents.sql
+```
+
+If it does NOT exist, create it:
 ```sql
--- Create the documents storage bucket for PDFs
+-- Storage bucket for estimate and invoice PDFs
 INSERT INTO storage.buckets (id, name, public, file_size_limit, allowed_mime_types)
 VALUES (
-  'documents',
-  'documents',
-  false,                          -- private — URLs are signed
-  10485760,                       -- 10MB max per file
-  ARRAY['application/pdf']
+  'documents', 'documents', false, 10485760, ARRAY['application/pdf']
 )
 ON CONFLICT (id) DO NOTHING;
 
--- RLS: users can only read documents for their own org
 CREATE POLICY "documents_org_read" ON storage.objects
   FOR SELECT USING (
     bucket_id = 'documents'
@@ -71,7 +97,6 @@ CREATE POLICY "documents_org_read" ON storage.objects
     )
   );
 
--- Service role can write (Edge Functions upload PDFs)
 CREATE POLICY "documents_service_write" ON storage.objects
   FOR INSERT TO service_role WITH CHECK (bucket_id = 'documents');
 
@@ -81,944 +106,304 @@ CREATE POLICY "documents_service_update" ON storage.objects
 
 ---
 
-## TASK 2 — PDF generation helper (shared Deno module)
+## TASK 4 — Verify/fix review_requests in AppSchema and sync rules
 
-Create `supabase/functions/_shared/pdf.ts`.
-This is imported by both `omnibid-send-estimate` and `omnibid-send-invoice`.
+### 4a. Check `packages/core-sync/src/schema.ts`
 
-PDF generation strategy: POST the HTML to a Gotenberg instance (self-hosted or the free demo).
-Store the resulting PDF bytes in Supabase Storage and return a signed URL.
-
-```typescript
-// supabase/functions/_shared/pdf.ts
-import { createClient } from 'https://esm.sh/@supabase/supabase-js@2';
-
-const supabase = createClient(
-  Deno.env.get('SUPABASE_URL')!,
-  Deno.env.get('SUPABASE_SERVICE_ROLE_KEY')!
-);
-
-/**
- * Convert an HTML string to a PDF using Gotenberg.
- * Set PDF_API_URL env var to your Gotenberg instance.
- * Free demo: https://demo.gotenberg.dev  (rate-limited — use for dev only)
- * Production: deploy Gotenberg to Railway/Fly.io and set the URL.
- */
-export async function htmlToPdf(html: string): Promise<Uint8Array> {
-  const apiUrl = Deno.env.get('PDF_API_URL') ?? 'https://demo.gotenberg.dev';
-
-  const form = new FormData();
-  form.append(
-    'files',
-    new Blob([html], { type: 'text/html' }),
-    'index.html'
-  );
-
-  // Gotenberg paper size + margins optimised for an invoice/estimate document
-  const res = await fetch(`${apiUrl}/forms/chromium/convert/html`, {
-    method: 'POST',
-    body: form,
-    // Optional Gotenberg headers for paper size
-    headers: {
-      'Gotenberg-Output-Filename': 'document.pdf',
-    },
-  });
-
-  if (!res.ok) {
-    const text = await res.text();
-    throw new Error(`PDF generation failed (${res.status}): ${text}`);
-  }
-
-  return new Uint8Array(await res.arrayBuffer());
-}
-
-/**
- * Upload a PDF to Supabase Storage (documents bucket).
- * Returns a signed URL valid for 7 days.
- * Path format: {org_id}/{document_type}/{filename}
- */
-export async function uploadPdf(
-  orgId: string,
-  folder: 'estimates' | 'invoices',
-  filename: string,
-  pdfBytes: Uint8Array
-): Promise<string> {
-  const path = `${orgId}/${folder}/${filename}`;
-
-  const { error } = await supabase.storage
-    .from('documents')
-    .upload(path, pdfBytes, {
-      contentType: 'application/pdf',
-      upsert: true,
-    });
-
-  if (error) throw new Error(`Storage upload failed: ${error.message}`);
-
-  // Signed URL — valid 7 days (604800 seconds)
-  const { data: signed } = await supabase.storage
-    .from('documents')
-    .createSignedUrl(path, 604800);
-
-  if (!signed?.signedUrl) throw new Error('Failed to create signed URL');
-
-  return signed.signedUrl;
-}
-
-/** Format cents as USD string for use inside PDF HTML templates */
-export function fmtCents(cents: number): string {
-  return (cents / 100).toLocaleString('en-US', { style: 'currency', currency: 'USD' });
-}
-```
-
----
-
-## TASK 3 — Update `omnibid-send-estimate` to generate and attach PDF
-
-Replace the entire contents of `supabase/functions/omnibid-send-estimate/index.ts`:
-
-```typescript
-import { serve }        from 'https://deno.land/std@0.177.0/http/server.ts';
-import { createClient } from 'https://esm.sh/@supabase/supabase-js@2';
-import Stripe           from 'https://esm.sh/stripe@14';
-import { Resend }       from 'https://esm.sh/resend@3';
-import { htmlToPdf, uploadPdf, fmtCents } from '../_shared/pdf.ts';
-
-const supabase = createClient(Deno.env.get('SUPABASE_URL')!, Deno.env.get('SUPABASE_SERVICE_ROLE_KEY')!);
-const stripe   = new Stripe(Deno.env.get('STRIPE_SECRET_KEY')!);
-const resend   = new Resend(Deno.env.get('RESEND_API_KEY')!);
-
-function buildEstimateHtml(
-  estimate: Record<string, unknown>,
-  items: Record<string, unknown>[],
-  org: Record<string, unknown>,
-  customer: Record<string, unknown>,
-  paymentUrl: string
-): string {
-  const rows = items
-    .filter((i: any) => i.is_customer_facing)
-    .map((item: any) => `
-      <tr>
-        <td style="padding:10px 0;border-bottom:1px solid #2d2d2d;color:#fff">${item.description}</td>
-        <td style="padding:10px 0;border-bottom:1px solid #2d2d2d;text-align:right;color:#C0C0C0">${item.quantity}${item.unit ? ' ' + item.unit : ''}</td>
-        <td style="padding:10px 0;border-bottom:1px solid #2d2d2d;text-align:right;color:#C0C0C0">${fmtCents(item.unit_price_cents)}</td>
-        <td style="padding:10px 0;border-bottom:1px solid #2d2d2d;text-align:right;font-weight:700;color:#fff">${fmtCents(item.total_cents)}</td>
-      </tr>`)
-    .join('');
-
-  const expiryLine = (estimate as any).expiry_date
-    ? `<p style="color:#f87171;font-size:13px;margin:4px 0 0">Expires ${new Date((estimate as any).expiry_date).toLocaleDateString('en-US', { month: 'long', day: 'numeric', year: 'numeric' })}</p>`
-    : '';
-
-  return `<!DOCTYPE html>
-<html>
-<head>
-  <meta charset="utf-8">
-  <style>
-    * { box-sizing: border-box; margin: 0; padding: 0; }
-    body { font-family: Inter, system-ui, sans-serif; background: #1A1A1A; color: #fff; padding: 48px 40px; }
-    table { width: 100%; border-collapse: collapse; }
-    th { text-align: left; padding-bottom: 10px; border-bottom: 2px solid #FF6600; color: #C0C0C0; font-size: 13px; font-weight: 600; letter-spacing: 0.05em; text-transform: uppercase; }
-    th:not(:first-child) { text-align: right; }
-  </style>
-</head>
-<body>
-  <!-- Header -->
-  <div style="display:flex;justify-content:space-between;align-items:flex-start;margin-bottom:48px">
-    <div>
-      <h1 style="font-size:28px;font-weight:800;color:#fff">${(org as any).name}</h1>
-      ${(org as any).phone ? `<p style="color:#C0C0C0;margin-top:4px">${(org as any).phone}</p>` : ''}
-      ${(org as any).email ? `<p style="color:#C0C0C0">${(org as any).email}</p>` : ''}
-    </div>
-    <div style="text-align:right">
-      <div style="background:#FF6600;color:#fff;font-size:11px;font-weight:700;letter-spacing:0.1em;text-transform:uppercase;padding:4px 12px;border-radius:4px;margin-bottom:8px;display:inline-block">ESTIMATE</div>
-      <p style="font-size:22px;font-weight:700;color:#fff">${(estimate as any).estimate_number}</p>
-      <p style="color:#C0C0C0;font-size:14px;margin-top:4px">
-        ${new Date((estimate as any).created_at).toLocaleDateString('en-US', { month: 'long', day: 'numeric', year: 'numeric' })}
-      </p>
-      ${expiryLine}
-    </div>
-  </div>
-
-  <!-- Bill To -->
-  <div style="margin-bottom:40px;padding:20px;background:#2D2D2D;border-radius:8px">
-    <p style="font-size:11px;font-weight:700;letter-spacing:0.1em;text-transform:uppercase;color:#C0C0C0;margin-bottom:8px">PREPARED FOR</p>
-    <p style="font-weight:700;color:#fff">${(customer as any).first_name ?? ''} ${(customer as any).last_name ?? ''}</p>
-    ${(customer as any).email ? `<p style="color:#C0C0C0;font-size:14px;margin-top:2px">${(customer as any).email}</p>` : ''}
-    ${(customer as any).phone ? `<p style="color:#C0C0C0;font-size:14px;margin-top:2px">${(customer as any).phone}</p>` : ''}
-  </div>
-
-  <!-- Line Items -->
-  <table style="margin-bottom:32px">
-    <thead>
-      <tr>
-        <th style="width:50%">Description</th>
-        <th>Qty</th>
-        <th>Unit Price</th>
-        <th>Total</th>
-      </tr>
-    </thead>
-    <tbody>${rows}</tbody>
-  </table>
-
-  <!-- Totals -->
-  <div style="text-align:right;margin-bottom:40px">
-    <table style="width:280px;margin-left:auto">
-      <tr>
-        <td style="padding:6px 0;color:#C0C0C0">Subtotal</td>
-        <td style="padding:6px 0;text-align:right;color:#fff;font-weight:600">${fmtCents((estimate as any).subtotal_cents)}</td>
-      </tr>
-      <tr>
-        <td style="padding:6px 0;color:#C0C0C0">Tax (${((estimate as any).tax_rate * 100).toFixed(2)}%)</td>
-        <td style="padding:6px 0;text-align:right;color:#fff;font-weight:600">${fmtCents((estimate as any).tax_cents)}</td>
-      </tr>
-      <tr style="border-top:2px solid #FF6600">
-        <td style="padding:12px 0;font-size:18px;font-weight:800;color:#fff">Total</td>
-        <td style="padding:12px 0;text-align:right;font-size:22px;font-weight:800;color:#FF6600">${fmtCents((estimate as any).total_cents)}</td>
-      </tr>
-    </table>
-  </div>
-
-  ${(estimate as any).customer_note ? `
-  <div style="padding:20px;background:#2D2D2D;border-radius:8px;margin-bottom:40px">
-    <p style="font-size:11px;font-weight:700;letter-spacing:0.1em;text-transform:uppercase;color:#C0C0C0;margin-bottom:8px">NOTES</p>
-    <p style="color:#fff;line-height:1.6">${(estimate as any).customer_note}</p>
-  </div>` : ''}
-
-  <!-- CTA -->
-  <div style="background:#FF6600;border-radius:12px;padding:32px;text-align:center">
-    <p style="color:#fff;font-size:18px;font-weight:800;margin-bottom:8px">Ready to move forward?</p>
-    <p style="color:rgba(255,255,255,0.85);font-size:14px;margin-bottom:20px">Accept and pay securely online</p>
-    <a href="${paymentUrl}" style="display:inline-block;background:#fff;color:#FF6600;padding:14px 36px;border-radius:8px;text-decoration:none;font-weight:800;font-size:16px">
-      Accept &amp; Pay — ${fmtCents((estimate as any).total_cents)}
-    </a>
-    <p style="color:rgba(255,255,255,0.6);font-size:12px;margin-top:16px">Powered by Stripe — 100% secure</p>
-  </div>
-</body>
-</html>`;
-}
-
-serve(async (req) => {
-  if (req.method !== 'POST') return new Response('Method not allowed', { status: 405 });
-
-  const authHeader = req.headers.get('Authorization');
-  if (!authHeader) return new Response('Unauthorized', { status: 401 });
-  const { data: { user } } = await supabase.auth.getUser(authHeader.replace('Bearer ', ''));
-  if (!user) return new Response('Unauthorized', { status: 401 });
-
-  const { estimate_id } = await req.json() as { estimate_id: string };
-
-  // Fetch all needed data
-  const [estRes, itemsRes] = await Promise.all([
-    supabase.from('estimates').select('*, customers(*), organizations(*)').eq('id', estimate_id).single(),
-    supabase.from('estimate_line_items').select('*').eq('estimate_id', estimate_id).order('sort_order'),
-  ]);
-
-  if (!estRes.data) return new Response('Estimate not found', { status: 404 });
-
-  const estimate = estRes.data;
-  const items    = itemsRes.data ?? [];
-  const customer = (estimate as any).customers;
-  const org      = (estimate as any).organizations;
-
-  if (!customer?.email) return new Response('Customer email required', { status: 400 });
-
-  // Auth check — user must belong to this org
-  const { data: userRow } = await supabase.from('users').select('id').eq('id', user.id).eq('org_id', estimate.org_id).single();
-  if (!userRow) return new Response('Forbidden', { status: 403 });
-
-  try {
-    // 1. Create Stripe Payment Link
-    const price = await stripe.prices.create({
-      currency: 'usd',
-      unit_amount: estimate.total_cents,
-      product_data: { name: `${org.name} — Estimate ${estimate.estimate_number}` },
-    });
-    const link = await stripe.paymentLinks.create({
-      line_items: [{ price: price.id, quantity: 1 }],
-      metadata: { estimate_id, org_id: estimate.org_id },
-    });
-
-    // 2. Generate PDF
-    const html      = buildEstimateHtml(estimate, items, org, customer, link.url);
-    const pdfBytes  = await htmlToPdf(html);
-    const filename  = `${estimate.estimate_number.replace(/[^a-z0-9-]/gi, '-')}.pdf`;
-    const pdfUrl    = await uploadPdf(estimate.org_id, 'estimates', filename, pdfBytes);
-
-    // 3. Send email with PDF attachment
-    await resend.emails.send({
-      from:    `${org.name} <estimates@mail.tradesuite.com>`,
-      to:      [customer.email],
-      subject: `Your estimate from ${org.name} — ${estimate.estimate_number}`,
-      html: `<div style="font-family:Inter,system-ui,sans-serif;background:#1A1A1A;color:#fff;padding:32px;max-width:600px;margin:0 auto">
-        <h2 style="color:#fff;margin-bottom:8px">Hi ${customer.first_name ?? 'there'},</h2>
-        <p style="color:#C0C0C0;margin-bottom:24px">Please find your estimate attached. You can also view and accept it online:</p>
-        <a href="${link.url}" style="display:inline-block;background:#FF6600;color:#fff;padding:14px 32px;border-radius:8px;text-decoration:none;font-weight:700;font-size:16px;margin-bottom:24px">
-          View &amp; Accept Estimate
-        </a>
-        <p style="color:#6b6b6b;font-size:13px">— ${org.name}</p>
-      </div>`,
-      attachments: [{
-        filename,
-        content: btoa(String.fromCharCode(...pdfBytes)),
-      }],
-    });
-
-    // 4. Update estimate record
-    await supabase.from('estimates').update({
-      status:   'sent',
-      sent_at:  new Date().toISOString(),
-      sent_via: 'email',
-      pdf_url:  pdfUrl,           // now the actual PDF in Storage, not the payment link
-    }).eq('id', estimate_id);
-
-    return new Response(JSON.stringify({ payment_link_url: link.url, pdf_url: pdfUrl }), {
-      headers: { 'Content-Type': 'application/json' },
-    });
-  } catch (err) {
-    console.error('omnibid-send-estimate error:', err);
-    return new Response(JSON.stringify({ error: (err as Error).message }), {
-      status: 500, headers: { 'Content-Type': 'application/json' },
-    });
-  }
-});
-```
-
-Deploy:
-```bash
-supabase functions deploy omnibid-send-estimate
-```
-
----
-
-## TASK 4 — New `omnibid-send-invoice` Edge Function
-
-Create `supabase/functions/omnibid-send-invoice/index.ts`:
-
-```typescript
-import { serve }        from 'https://deno.land/std@0.177.0/http/server.ts';
-import { createClient } from 'https://esm.sh/@supabase/supabase-js@2';
-import Stripe           from 'https://esm.sh/stripe@14';
-import { Resend }       from 'https://esm.sh/resend@3';
-import { htmlToPdf, uploadPdf, fmtCents } from '../_shared/pdf.ts';
-
-const supabase = createClient(Deno.env.get('SUPABASE_URL')!, Deno.env.get('SUPABASE_SERVICE_ROLE_KEY')!);
-const stripe   = new Stripe(Deno.env.get('STRIPE_SECRET_KEY')!);
-const resend   = new Resend(Deno.env.get('RESEND_API_KEY')!);
-
-function buildInvoiceHtml(
-  invoice: Record<string, unknown>,
-  payments: Record<string, unknown>[],
-  estimate: Record<string, unknown> | null,
-  org: Record<string, unknown>,
-  customer: Record<string, unknown>,
-  paymentUrl: string
-): string {
-  const invoiceData = invoice as any;
-  const orgData     = org as any;
-  const custData    = customer as any;
-  const totalPaid   = payments.reduce((s: number, p: any) => s + (p.amount_cents ?? 0), 0);
-  const balance     = invoiceData.balance_cents ?? (invoiceData.total_cents - totalPaid);
-
-  const isPaid = invoiceData.status === 'paid' || balance <= 0;
-
-  return `<!DOCTYPE html>
-<html>
-<head>
-  <meta charset="utf-8">
-  <style>
-    * { box-sizing: border-box; margin: 0; padding: 0; }
-    body { font-family: Inter, system-ui, sans-serif; background: #1A1A1A; color: #fff; padding: 48px 40px; }
-    table { width: 100%; border-collapse: collapse; }
-    th { text-align: left; padding-bottom: 10px; border-bottom: 2px solid #FF6600; color: #C0C0C0; font-size: 13px; font-weight: 600; letter-spacing: 0.05em; text-transform: uppercase; }
-    th:not(:first-child) { text-align: right; }
-  </style>
-</head>
-<body>
-  <!-- Header -->
-  <div style="display:flex;justify-content:space-between;align-items:flex-start;margin-bottom:48px">
-    <div>
-      <h1 style="font-size:28px;font-weight:800;color:#fff">${orgData.name}</h1>
-      ${orgData.phone ? `<p style="color:#C0C0C0;margin-top:4px">${orgData.phone}</p>` : ''}
-      ${orgData.email ? `<p style="color:#C0C0C0">${orgData.email}</p>` : ''}
-    </div>
-    <div style="text-align:right">
-      <div style="background:${isPaid ? '#166046' : '#FF6600'};color:#fff;font-size:11px;font-weight:700;letter-spacing:0.1em;text-transform:uppercase;padding:4px 12px;border-radius:4px;margin-bottom:8px;display:inline-block">
-        ${isPaid ? 'PAID' : 'INVOICE'}
-      </div>
-      <p style="font-size:22px;font-weight:700;color:#fff">${invoiceData.invoice_number}</p>
-      <p style="color:#C0C0C0;font-size:14px;margin-top:4px">
-        ${new Date(invoiceData.created_at).toLocaleDateString('en-US', { month: 'long', day: 'numeric', year: 'numeric' })}
-      </p>
-      ${invoiceData.due_date ? `<p style="color:${isPaid ? '#34d399' : '#f87171'};font-size:13px;margin-top:4px">
-        Due ${new Date(invoiceData.due_date).toLocaleDateString('en-US', { month: 'long', day: 'numeric', year: 'numeric' })}
-      </p>` : ''}
-    </div>
-  </div>
-
-  <!-- Bill To -->
-  <div style="margin-bottom:40px;padding:20px;background:#2D2D2D;border-radius:8px">
-    <p style="font-size:11px;font-weight:700;letter-spacing:0.1em;text-transform:uppercase;color:#C0C0C0;margin-bottom:8px">BILL TO</p>
-    <p style="font-weight:700;color:#fff">${custData.first_name ?? ''} ${custData.last_name ?? ''}</p>
-    ${custData.email ? `<p style="color:#C0C0C0;font-size:14px;margin-top:2px">${custData.email}</p>` : ''}
-    ${custData.phone ? `<p style="color:#C0C0C0;font-size:14px;margin-top:2px">${custData.phone}</p>` : ''}
-  </div>
-
-  ${estimate ? `<div style="margin-bottom:32px;padding:12px 20px;background:#2D2D2D;border-radius:8px;border-left:3px solid #FF6600">
-    <p style="color:#C0C0C0;font-size:13px">Re: Estimate ${(estimate as any).estimate_number}</p>
-  </div>` : ''}
-
-  <!-- Totals Summary -->
-  <div style="margin-bottom:40px">
-    <table style="width:320px;margin-left:auto">
-      <tr>
-        <td style="padding:8px 0;color:#C0C0C0">Subtotal</td>
-        <td style="padding:8px 0;text-align:right;color:#fff;font-weight:600">${fmtCents(invoiceData.subtotal_cents)}</td>
-      </tr>
-      <tr>
-        <td style="padding:8px 0;color:#C0C0C0">Tax</td>
-        <td style="padding:8px 0;text-align:right;color:#fff;font-weight:600">${fmtCents(invoiceData.tax_cents)}</td>
-      </tr>
-      <tr style="border-top:1px solid #3d3d3d">
-        <td style="padding:10px 0;font-weight:700;color:#fff">Invoice Total</td>
-        <td style="padding:10px 0;text-align:right;font-weight:700;color:#fff">${fmtCents(invoiceData.total_cents)}</td>
-      </tr>
-      ${totalPaid > 0 ? `<tr>
-        <td style="padding:8px 0;color:#34d399">Paid</td>
-        <td style="padding:8px 0;text-align:right;color:#34d399;font-weight:600">− ${fmtCents(totalPaid)}</td>
-      </tr>` : ''}
-      <tr style="border-top:2px solid #FF6600">
-        <td style="padding:14px 0;font-size:18px;font-weight:800;color:#fff">Balance Due</td>
-        <td style="padding:14px 0;text-align:right;font-size:22px;font-weight:800;color:${isPaid ? '#34d399' : '#FF6600'}">
-          ${isPaid ? 'PAID' : fmtCents(balance)}
-        </td>
-      </tr>
-    </table>
-  </div>
-
-  ${invoiceData.customer_note ? `
-  <div style="padding:20px;background:#2D2D2D;border-radius:8px;margin-bottom:40px">
-    <p style="font-size:11px;font-weight:700;letter-spacing:0.1em;text-transform:uppercase;color:#C0C0C0;margin-bottom:8px">NOTES</p>
-    <p style="color:#fff;line-height:1.6">${invoiceData.customer_note}</p>
-  </div>` : ''}
-
-  ${!isPaid ? `
-  <!-- Pay CTA -->
-  <div style="background:#FF6600;border-radius:12px;padding:32px;text-align:center">
-    <p style="color:#fff;font-size:18px;font-weight:800;margin-bottom:8px">Balance due: ${fmtCents(balance)}</p>
-    <p style="color:rgba(255,255,255,0.85);font-size:14px;margin-bottom:20px">Pay securely online — takes less than a minute</p>
-    <a href="${paymentUrl}" style="display:inline-block;background:#fff;color:#FF6600;padding:14px 36px;border-radius:8px;text-decoration:none;font-weight:800;font-size:16px">
-      Pay Now — ${fmtCents(balance)}
-    </a>
-    <p style="color:rgba(255,255,255,0.6);font-size:12px;margin-top:16px">Powered by Stripe — 100% secure</p>
-  </div>` : `
-  <!-- Paid confirmation -->
-  <div style="background:#1a3d2e;border:1px solid #166046;border-radius:12px;padding:24px;text-align:center">
-    <p style="color:#34d399;font-size:18px;font-weight:800">✓ Paid in full — thank you!</p>
-    ${invoiceData.paid_at ? `<p style="color:#C0C0C0;font-size:13px;margin-top:4px">
-      ${new Date(invoiceData.paid_at).toLocaleDateString('en-US', { month: 'long', day: 'numeric', year: 'numeric' })}
-    </p>` : ''}
-  </div>`}
-</body>
-</html>`;
-}
-
-serve(async (req) => {
-  if (req.method !== 'POST') return new Response('Method not allowed', { status: 405 });
-
-  const authHeader = req.headers.get('Authorization');
-  if (!authHeader) return new Response('Unauthorized', { status: 401 });
-  const { data: { user } } = await supabase.auth.getUser(authHeader.replace('Bearer ', ''));
-  if (!user) return new Response('Unauthorized', { status: 401 });
-
-  const { invoice_id } = await req.json() as { invoice_id: string };
-
-  // Fetch invoice + related data
-  const [invRes, paymentsRes] = await Promise.all([
-    supabase.from('invoices')
-      .select('*, customers(*), organizations(*), estimates(estimate_number)')
-      .eq('id', invoice_id).single(),
-    supabase.from('invoice_payments').select('*').eq('invoice_id', invoice_id),
-  ]);
-
-  if (!invRes.data) return new Response('Invoice not found', { status: 404 });
-
-  const invoice  = invRes.data;
-  const payments = paymentsRes.data ?? [];
-  const customer = (invoice as any).customers;
-  const org      = (invoice as any).organizations;
-  const estimate = (invoice as any).estimates ?? null;
-
-  if (!customer?.email) return new Response('Customer email required', { status: 400 });
-
-  // Auth check
-  const { data: userRow } = await supabase.from('users').select('id').eq('id', user.id).eq('org_id', invoice.org_id).single();
-  if (!userRow) return new Response('Forbidden', { status: 403 });
-
-  const totalPaid = payments.reduce((s: number, p: any) => s + (p.amount_cents ?? 0), 0);
-  const balance   = invoice.balance_cents ?? (invoice.total_cents - totalPaid);
-  const isPaid    = invoice.status === 'paid' || balance <= 0;
-
-  try {
-    let paymentUrl = invoice.payment_link_url ?? '';
-
-    // Create Stripe Payment Link if invoice is unpaid and no link exists yet
-    if (!isPaid && !invoice.payment_link_url) {
-      const price = await stripe.prices.create({
-        currency: 'usd',
-        unit_amount: balance,
-        product_data: { name: `${org.name} — Invoice ${invoice.invoice_number}` },
-      });
-      const link = await stripe.paymentLinks.create({
-        line_items: [{ price: price.id, quantity: 1 }],
-        metadata: { invoice_id, org_id: invoice.org_id },
-      });
-      paymentUrl = link.url;
-
-      await supabase.from('invoices').update({ payment_link_url: paymentUrl }).eq('id', invoice_id);
-    }
-
-    // Generate PDF
-    const html     = buildInvoiceHtml(invoice, payments, estimate, org, customer, paymentUrl);
-    const pdfBytes = await htmlToPdf(html);
-    const filename = `${invoice.invoice_number.replace(/[^a-z0-9-]/gi, '-')}.pdf`;
-    const pdfUrl   = await uploadPdf(invoice.org_id, 'invoices', filename, pdfBytes);
-
-    // Send email with PDF attachment
-    const subject = isPaid
-      ? `Receipt from ${org.name} — ${invoice.invoice_number}`
-      : `Invoice from ${org.name} — ${invoice.invoice_number}`;
-
-    await resend.emails.send({
-      from:    `${org.name} <invoices@mail.tradesuite.com>`,
-      to:      [customer.email],
-      subject,
-      html: `<div style="font-family:Inter,system-ui,sans-serif;background:#1A1A1A;color:#fff;padding:32px;max-width:600px;margin:0 auto">
-        <h2 style="color:#fff;margin-bottom:8px">Hi ${customer.first_name ?? 'there'},</h2>
-        ${isPaid
-          ? `<p style="color:#C0C0C0;margin-bottom:24px">Thank you for your payment! Your receipt is attached.</p>`
-          : `<p style="color:#C0C0C0;margin-bottom:24px">Your invoice is attached. The balance due is <strong style="color:#FF6600">${fmtCents(balance)}</strong>.</p>
-             <a href="${paymentUrl}" style="display:inline-block;background:#FF6600;color:#fff;padding:14px 32px;border-radius:8px;text-decoration:none;font-weight:700;font-size:16px;margin-bottom:24px">Pay Now</a>`
-        }
-        <p style="color:#6b6b6b;font-size:13px">— ${org.name}</p>
-      </div>`,
-      attachments: [{
-        filename,
-        content: btoa(String.fromCharCode(...pdfBytes)),
-      }],
-    });
-
-    // Update invoice sent status
-    if (!isPaid) {
-      await supabase.from('invoices').update({
-        status:  'sent',
-        sent_at: new Date().toISOString(),
-        sent_via: 'email',
-      }).eq('id', invoice_id).eq('status', 'draft');
-    }
-
-    return new Response(JSON.stringify({ pdf_url: pdfUrl, payment_link_url: paymentUrl }), {
-      headers: { 'Content-Type': 'application/json' },
-    });
-  } catch (err) {
-    console.error('omnibid-send-invoice error:', err);
-    return new Response(JSON.stringify({ error: (err as Error).message }), {
-      status: 500, headers: { 'Content-Type': 'application/json' },
-    });
-  }
-});
-```
-
-Deploy:
-```bash
-supabase functions deploy omnibid-send-invoice
-```
-
----
-
-## TASK 5 — Add `sendInvoice` to OmniBid hooks
-
-Open `modules/estimates/src/hooks/useEstimates.ts` and add this to `useEstimateActions`:
-
-```typescript
-const sendInvoice = useCallback(async (invoiceId: string) => {
-  const { data: { session } } = await supabase.auth.getSession();
-  const res = await fetch(
-    `${(import.meta as any).env.VITE_SUPABASE_URL}/functions/v1/omnibid-send-invoice`,
-    {
-      method: 'POST',
-      headers: {
-        'Authorization': `Bearer ${session?.access_token}`,
-        'Content-Type': 'application/json',
-      },
-      body: JSON.stringify({ invoice_id: invoiceId }),
-    }
-  );
-  if (!res.ok) throw new Error(await res.text());
-  return res.json() as Promise<{ pdf_url: string; payment_link_url: string }>;
-}, []);
-```
-
-Export it from the return value of `useEstimateActions`.
-
----
-
-## TASK 6 — Add `PDF_API_URL` and `STRIPE_WEBHOOK_SECRET` to environment docs
-
-Update `.env.example` or the env documentation at the repo root to include:
-
-```bash
-# PDF generation (Gotenberg)
-# Dev: use https://demo.gotenberg.dev (rate-limited, do not use in production)
-# Prod: deploy Gotenberg to Railway/Fly.io — docker image: gotenberg/gotenberg:8
-PDF_API_URL=https://demo.gotenberg.dev
-
-# Stripe webhook signing secret (from Stripe dashboard → Webhooks → signing secret)
-STRIPE_WEBHOOK_SECRET=whsec_...
-```
-
-Also add `PDF_API_URL` and `STRIPE_WEBHOOK_SECRET` as secrets for the relevant Edge Functions:
-```bash
-supabase secrets set PDF_API_URL=https://demo.gotenberg.dev
-supabase secrets set STRIPE_WEBHOOK_SECRET=whsec_...
-```
-
----
-
-## TASK 7 — Add review_requests to AppSchema and sync rules
-
-### 7a. Open `packages/core-sync/src/schema.ts`
-
-Check if `review_requests` is already in `AppSchema`. If not, add it:
+Search for `review_requests` in the AppSchema export. If missing, add this table definition and include it in the AppSchema:
 
 ```typescript
 const review_requests = new Table(
   {
-    org_id:      column.text,
-    job_id:      column.text,
-    customer_id: column.text,
-    status:      column.text,
-    sent_via:    column.text,
-    platform:    column.text,
-    review_url:  column.text,
-    sent_at:     column.text,
-    clicked_at:  column.text,
-    reviewed_at: column.text,
-    star_rating: column.integer,
-    review_text: column.text,
+    org_id:        column.text,
+    job_id:        column.text,
+    customer_id:   column.text,
+    status:        column.text,
+    sent_via:      column.text,
+    platform:      column.text,
+    review_url:    column.text,
+    sent_at:       column.text,
+    clicked_at:    column.text,
+    reviewed_at:   column.text,
+    star_rating:   column.integer,
+    review_text:   column.text,
     inngest_run_id: column.text,
-    created_at:  column.text,
-    updated_at:  column.text,
+    created_at:    column.text,
+    updated_at:    column.text,
   },
   { indexes: { by_status: ['status', 'created_at'] } }
 );
-
-// Add to AppSchema export:
-// review_requests,
+// Add review_requests to the AppSchema export object
 ```
 
-### 7b. Open `packages/core-sync/sync-rules.yaml`
+### 4b. Check `packages/core-sync/sync-rules.yaml`
 
-Verify `review_requests` is present. If not, add:
+If `review_requests` is not in the data section, add it:
 ```yaml
 - SELECT * FROM review_requests WHERE org_id = bucket.org_id
 ```
 
 ---
 
-## TASK 8 — Wire RepuGuard trigger on job completion
+## TASK 5 — Fix is_customer_facing column in estimate send function
 
-When a job is marked complete in the app, we need to fire the `repuguard/job.completed` Inngest event. Find `apps/pwa/src/pages/JobDetailPage.tsx` and locate where job status is updated to `'complete'` or `'closed'`.
-
-After the Supabase update call that changes status to complete, add:
-
+Open `supabase/functions/omnibid-send-estimate/index.ts`. Find this line in `buildEstimateHtml`:
 ```typescript
-// Fire RepuGuard review sequence via Inngest
-if (newStatus === 'complete' || newStatus === 'closed') {
-  const { data: { session } } = await supabase.auth.getSession();
-  fetch(
-    `${import.meta.env.VITE_SUPABASE_URL}/functions/v1/trigger-repuguard`,
-    {
-      method: 'POST',
-      headers: {
-        'Authorization': `Bearer ${session?.access_token}`,
-        'Content-Type': 'application/json',
-      },
-      body: JSON.stringify({
-        job_id:      job.id,
-        customer_id: job.customer_id,
-        org_id:      job.org_id,
-      }),
-    }
-  ).catch(console.error); // fire-and-forget
-}
+.filter((i: any) => i.is_customer_facing)
 ```
 
-Create `supabase/functions/trigger-repuguard/index.ts` to receive this and fire the Inngest event:
+Check `modules/estimates/supabase/migrations/0001_omnibid_schema.sql` to see if `is_customer_facing` column exists on `estimate_line_items`.
 
+**If the column does NOT exist**, remove the filter so all line items are included:
 ```typescript
-import { serve }        from 'https://deno.land/std@0.177.0/http/server.ts';
-import { createClient } from 'https://esm.sh/@supabase/supabase-js@2';
-
-const supabase = createClient(Deno.env.get('SUPABASE_URL')!, Deno.env.get('SUPABASE_SERVICE_ROLE_KEY')!);
-
-serve(async (req) => {
-  if (req.method !== 'POST') return new Response('Method not allowed', { status: 405 });
-
-  const authHeader = req.headers.get('Authorization');
-  if (!authHeader) return new Response('Unauthorized', { status: 401 });
-  const { data: { user } } = await supabase.auth.getUser(authHeader.replace('Bearer ', ''));
-  if (!user) return new Response('Unauthorized', { status: 401 });
-
-  const { job_id, customer_id, org_id } = await req.json() as {
-    job_id: string; customer_id: string; org_id: string;
-  };
-
-  // Verify org has RepuGuard active
-  const { data: org } = await supabase
-    .from('organizations')
-    .select('active_modules, review_delay_hours')
-    .eq('id', org_id).single();
-
-  if (!org?.active_modules?.includes('reviews')) {
-    return new Response(JSON.stringify({ skipped: true, reason: 'reviews module not active' }), {
-      headers: { 'Content-Type': 'application/json' },
-    });
-  }
-
-  // Fire Inngest event
-  const res = await fetch(Deno.env.get('INNGEST_EVENT_URL') ?? 'https://inn.gs/e', {
-    method: 'POST',
-    headers: {
-      'Authorization': `Bearer ${Deno.env.get('INNGEST_EVENT_KEY')}`,
-      'Content-Type': 'application/json',
-    },
-    body: JSON.stringify({
-      name: 'repuguard/job.completed',
-      data: {
-        job_id,
-        customer_id,
-        org_id,
-        delay_hours: org.review_delay_hours ?? 24,
-      },
-    }),
-  });
-
-  if (!res.ok) {
-    console.error('trigger-repuguard: Inngest error', await res.text());
-    return new Response('Inngest error', { status: 500 });
-  }
-
-  return new Response(JSON.stringify({ fired: true }), {
-    headers: { 'Content-Type': 'application/json' },
-  });
-});
+// Remove the .filter line — show all items
+const rows = items
+  .map((item: any) => `...`)
+  .join('');
 ```
 
-Deploy:
-```bash
-supabase functions deploy trigger-repuguard
-```
+**If the column DOES exist**, keep the filter as-is.
 
 ---
 
-## TASK 9 — Settings: Review platform URLs
+## TASK 6 — Add ForgotPasswordPage stub
 
-Open `apps/pwa/src/pages/settings/SettingsPage.tsx`. Add a "Review Links" section (or find where org settings are edited). Add three URL inputs:
+`LoginPage.tsx` navigates to `/auth/forgot-password` but this page doesn't exist, causing a crash if the user taps "Forgot your password?".
 
-```tsx
-// Inside the settings form, add a section for review links.
-// These save directly to supabase.from('organizations').update(...)
-
-// Fields to add:
-// google_review_url   — label: "Google Review Link"
-// yelp_review_url     — label: "Yelp Review Link"
-// facebook_review_url — label: "Facebook Review Link"
-// review_delay_hours  — label: "Hours after job completion to send request" (number input, default 24)
-```
-
-The save should call:
-```typescript
-await supabase.from('organizations')
-  .update({
-    google_review_url:   googleUrl || null,
-    yelp_review_url:     yelpUrl || null,
-    facebook_review_url: facebookUrl || null,
-    review_delay_hours:  delayHours,
-  })
-  .eq('id', org.id);
-```
-
-Show a toast/confirmation on save. Use the same card/input styling as the rest of the settings page.
-
----
-
-## TASK 10 — Settings: Price book management page
-
-Create `apps/pwa/src/pages/settings/PriceBookPage.tsx`:
+Create `apps/pwa/src/pages/auth/ForgotPasswordPage.tsx`:
 
 ```tsx
-import { useState } from 'react';
+import React, { useState } from 'react';
 import { useNavigate } from 'react-router-dom';
-import { usePriceBook } from '@trades-saas/estimates';
+import { Button, Field, Input } from '@trades-saas/core-ui';
 import { getSupabaseClient } from '@trades-saas/core-auth';
-import { useOrgId } from '@trades-saas/core-ui';   // or however orgId is accessed
 
 const supabase = getSupabaseClient();
 
-export default function PriceBookPage() {
+export default function ForgotPasswordPage() {
   const navigate = useNavigate();
-  const orgId    = useOrgId();
-  const { data: items } = usePriceBook();
+  const [email,   setEmail]   = useState('');
+  const [loading, setLoading] = useState(false);
+  const [sent,    setSent]    = useState(false);
+  const [error,   setError]   = useState<string | null>(null);
 
-  const [showForm, setShowForm] = useState(false);
-  const [form, setForm] = useState({
-    name: '', category: '', unit: 'each', unit_price: '', description: '',
-  });
-  const [saving, setSaving] = useState(false);
-
-  async function handleAdd() {
-    if (!form.name || !form.unit_price) return;
-    setSaving(true);
+  async function handleSubmit(e: React.FormEvent) {
+    e.preventDefault();
+    setLoading(true);
+    setError(null);
     try {
-      await supabase.from('price_book').insert({
-        org_id:     orgId,
-        name:       form.name,
-        category:   form.category || null,
-        unit:       form.unit,
-        unit_price: parseFloat(form.unit_price),   // price book stores dollars
-        active:     true,
+      const { error: err } = await supabase.auth.resetPasswordForEmail(email, {
+        redirectTo: `${window.location.origin}/auth/reset-password`,
       });
-      setForm({ name: '', category: '', unit: 'each', unit_price: '', description: '' });
-      setShowForm(false);
+      if (err) throw err;
+      setSent(true);
+    } catch (err) {
+      setError(err instanceof Error ? err.message : 'Failed to send reset email');
     } finally {
-      setSaving(false);
+      setLoading(false);
     }
   }
 
-  async function handleToggleActive(id: string, currentActive: boolean) {
-    await supabase.from('price_book').update({ active: !currentActive }).eq('id', id);
-  }
+  return (
+    <div className="min-h-[100dvh] flex flex-col bg-surface">
+      <div className="bg-brand px-6 pt-16 pb-10">
+        <h1 className="font-bold text-field-2xl text-white">Reset Password</h1>
+        <p className="text-field-sm text-white/70 mt-1">We'll send you a reset link</p>
+      </div>
 
-  async function handleDelete(id: string) {
-    await supabase.from('price_book').delete().eq('id', id);
-  }
+      <div className="flex-1 px-6 py-8">
+        {sent ? (
+          <div className="max-w-sm">
+            <div className="bg-surface-raised border border-success/20 rounded-card p-4 mb-6">
+              <p className="text-field-sm text-success font-semibold">Check your email</p>
+              <p className="text-field-xs text-content-secondary mt-1">
+                We sent a password reset link to {email}
+              </p>
+            </div>
+            <Button variant="secondary" fullWidth onClick={() => navigate('/auth/login')}>
+              Back to Sign In
+            </Button>
+          </div>
+        ) : (
+          <form onSubmit={handleSubmit} className="flex flex-col gap-5 max-w-sm">
+            <Field label="Email">
+              <Input
+                type="email"
+                placeholder="you@yourbusiness.com"
+                value={email}
+                onChange={e => setEmail(e.target.value)}
+                autoComplete="email"
+                required
+              />
+            </Field>
 
-  // Group by category
-  const grouped = items.reduce<Record<string, typeof items>>((acc, item) => {
-    const cat = item.category ?? 'Uncategorized';
-    if (!acc[cat]) acc[cat] = [];
-    acc[cat].push(item);
-    return acc;
-  }, {});
+            {error && (
+              <div className="bg-surface-raised border border-danger/20 rounded-card px-4 py-3">
+                <p className="text-field-sm text-danger">{error}</p>
+              </div>
+            )}
+
+            <Button type="submit" variant="primary" fullWidth loading={loading}>
+              Send Reset Link
+            </Button>
+
+            <button
+              type="button"
+              className="text-field-sm text-brand font-medium text-center py-2 touch-manipulation"
+              onClick={() => navigate('/auth/login')}
+            >
+              Back to Sign In
+            </button>
+          </form>
+        )}
+      </div>
+    </div>
+  );
+}
+```
+
+Add to `apps/pwa/src/App.tsx` in the public routes section:
+```tsx
+const ForgotPasswordPage = lazy(() => import('./pages/auth/ForgotPasswordPage'));
+// Add route alongside LoginPage:
+<Route path="/auth/forgot-password" element={<ForgotPasswordPage />} />
+```
+
+---
+
+## TASK 7 — Build JobsPage
+
+Replace `apps/pwa/src/pages/JobsPage.tsx` entirely:
+
+```tsx
+import React, { useState } from 'react';
+import { useNavigate } from 'react-router-dom';
+import { PageHeader, Section, Button, useReactiveQuery } from '@trades-saas/core-ui';
+import { JobCard } from '@trades-saas/core-ui';
+import type { JobCardData } from '@trades-saas/core-ui';
+import type { JobStatus } from '@trades-saas/core-types';
+import { JOB_STATUS_LABELS } from '@trades-saas/core-types';
+import { useAuth } from '../providers';
+
+type Filter = 'all' | JobStatus;
+
+const FILTERS: { key: Filter; label: string }[] = [
+  { key: 'all',       label: 'All'         },
+  { key: 'lead',      label: 'Lead'        },
+  { key: 'scheduled', label: 'Scheduled'   },
+  { key: 'active',    label: 'In Progress' },
+  { key: 'complete',  label: 'Complete'    },
+  { key: 'closed',    label: 'Closed'      },
+];
+
+interface JobRow {
+  id: string; org_id: string; customer_id: string;
+  title: string; description: string | null; status: string; source: string;
+  assigned_to: string | null; location: string | null; trade_type: string | null;
+  scheduled_at: string | null; completed_at: string | null;
+  estimated_value_cents: number | null; final_value_cents: number | null;
+  job_number: string; created_at: string; updated_at: string;
+  customer_name: string; assigned_to_name: string | null;
+  estimate_total_cents: number | null;
+}
+
+export default function JobsPage() {
+  const navigate = useNavigate();
+  const { org }  = useAuth();
+  const orgId    = org?.id ?? '';
+  const [filter, setFilter] = useState<Filter>('all');
+
+  const whereStatus = filter === 'all'
+    ? `status NOT IN ('cancelled')`
+    : `status = '${filter}'`;
+
+  const { data: rows } = useReactiveQuery<JobRow>(`
+    SELECT
+      j.*,
+      c.name AS customer_name,
+      u.name AS assigned_to_name,
+      e.total_cents AS estimate_total_cents
+    FROM jobs j
+    LEFT JOIN customers  c ON c.id = j.customer_id
+    LEFT JOIN users      u ON u.id = j.assigned_to
+    LEFT JOIN estimates  e ON e.job_id = j.id AND e.status NOT IN ('declined')
+    WHERE j.org_id = ?
+      AND j.${whereStatus}
+    ORDER BY
+      CASE j.status
+        WHEN 'active'    THEN 1
+        WHEN 'scheduled' THEN 2
+        WHEN 'lead'      THEN 3
+        WHEN 'complete'  THEN 4
+        WHEN 'closed'    THEN 5
+        ELSE 6
+      END,
+      j.scheduled_at ASC,
+      j.created_at DESC
+    LIMIT 100
+  `, [orgId]);
+
+  const jobs: JobCardData[] = rows.map(r => ({
+    job: {
+      id: r.id, org_id: r.org_id, customer_id: r.customer_id,
+      title: r.title, description: r.description,
+      status: r.status as JobStatus, source: r.source as any,
+      assigned_to: r.assigned_to, location: r.location, trade_type: r.trade_type as any,
+      scheduled_at: r.scheduled_at, completed_at: r.completed_at,
+      estimated_value_cents: r.estimated_value_cents, final_value_cents: r.final_value_cents,
+      job_number: r.job_number, created_at: r.created_at, updated_at: r.updated_at,
+    },
+    customer_name:    r.customer_name,
+    assigned_to_name: r.assigned_to_name,
+    ...(r.estimate_total_cents != null ? { estimate_total_cents: r.estimate_total_cents } : {}),
+  }));
 
   return (
     <div className="flex flex-col h-full bg-surface">
-      <div className="flex items-center gap-3 px-4 py-3 border-b border-surface-border">
-        <button onClick={() => navigate('/settings')} className="text-content-secondary hover:text-content p-1 -ml-1">
-          <svg className="w-5 h-5" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
-            <path strokeLinecap="round" strokeLinejoin="round" d="M15 19l-7-7 7-7" />
-          </svg>
-        </button>
-        <h1 className="text-field-lg font-extrabold text-content flex-1">Price Book</h1>
-        <button
-          onClick={() => setShowForm(true)}
-          className="text-field-xs font-bold bg-brand text-white px-3 py-2 rounded-button hover:bg-brand-mid transition-colors"
-        >
-          + Add Item
-        </button>
+      <PageHeader
+        title="Jobs"
+        actions={
+          <Button variant="primary" size="sm" onClick={() => navigate('/jobs/new')}>
+            + New
+          </Button>
+        }
+      />
+
+      {/* Status filter tabs */}
+      <div className="flex gap-1 overflow-x-auto px-4 py-3 border-b border-surface-border scrollbar-none">
+        {FILTERS.map(({ key, label }) => (
+          <button
+            key={key}
+            onClick={() => setFilter(key)}
+            className={`shrink-0 text-field-xs font-bold px-3 py-1.5 rounded-full transition-colors ${
+              filter === key
+                ? 'bg-brand text-white'
+                : 'text-content-secondary hover:text-content hover:bg-surface-raised'
+            }`}
+          >
+            {label}
+          </button>
+        ))}
       </div>
 
+      {/* Job list */}
       <div className="flex-1 overflow-y-auto">
-        {/* Add form */}
-        {showForm && (
-          <div className="m-4 p-4 bg-surface-raised rounded-card border border-surface-border">
-            <p className="text-field-sm font-bold text-content mb-3">New Item</p>
-            <div className="space-y-2">
-              {[
-                { key: 'name', label: 'Name', placeholder: 'e.g. Install 2-ton AC unit' },
-                { key: 'category', label: 'Category', placeholder: 'e.g. HVAC, Labor, Materials' },
-                { key: 'description', label: 'Description (optional)', placeholder: '' },
-              ].map(({ key, label, placeholder }) => (
-                <div key={key}>
-                  <label className="text-field-xs text-content-muted block mb-1">{label}</label>
-                  <input
-                    value={(form as any)[key]}
-                    onChange={e => setForm(f => ({ ...f, [key]: e.target.value }))}
-                    placeholder={placeholder}
-                    className="w-full bg-surface-sunken text-content text-field-sm rounded-input px-3 py-2 border border-surface-border focus:border-brand outline-none"
-                  />
-                </div>
-              ))}
-              <div className="flex gap-2">
-                <div className="flex-1">
-                  <label className="text-field-xs text-content-muted block mb-1">Unit</label>
-                  <select
-                    value={form.unit}
-                    onChange={e => setForm(f => ({ ...f, unit: e.target.value }))}
-                    className="w-full bg-surface-sunken text-content text-field-sm rounded-input px-3 py-2 border border-surface-border focus:border-brand outline-none"
-                  >
-                    {['each', 'hour', 'sqft', 'lnft', 'ton', 'lb', 'ft'].map(u => (
-                      <option key={u} value={u}>{u}</option>
-                    ))}
-                  </select>
-                </div>
-                <div className="flex-1">
-                  <label className="text-field-xs text-content-muted block mb-1">Price ($)</label>
-                  <input
-                    type="number"
-                    value={form.unit_price}
-                    onChange={e => setForm(f => ({ ...f, unit_price: e.target.value }))}
-                    placeholder="0.00"
-                    min="0"
-                    step="0.01"
-                    className="w-full bg-surface-sunken text-content text-field-sm font-mono rounded-input px-3 py-2 border border-surface-border focus:border-brand outline-none"
-                  />
-                </div>
-              </div>
-            </div>
-            <div className="flex gap-2 mt-3">
-              <button onClick={() => setShowForm(false)} className="flex-1 py-2 text-field-sm text-content-secondary border border-surface-border rounded-button hover:border-content-muted transition-colors">
-                Cancel
-              </button>
-              <button onClick={handleAdd} disabled={saving || !form.name || !form.unit_price}
-                className="flex-1 py-2 text-field-sm font-bold bg-brand text-white rounded-button hover:bg-brand-mid transition-colors disabled:opacity-30">
-                {saving ? 'Saving...' : 'Add Item'}
-              </button>
-            </div>
-          </div>
-        )}
-
-        {/* Grouped list */}
-        {Object.entries(grouped).map(([category, catItems]) => (
-          <div key={category}>
-            <p className="px-4 py-2 text-[10px] font-bold text-content-muted uppercase tracking-widest bg-surface/80 sticky top-0">
-              {category}
-            </p>
-            {catItems.map(item => (
-              <div key={item.id} className={`flex items-center gap-3 px-4 py-3 border-b border-surface-border ${!item.active ? 'opacity-40' : ''}`}>
-                <div className="flex-1 min-w-0">
-                  <p className="text-field-sm font-semibold text-content truncate">{item.name}</p>
-                  <p className="text-field-xs text-content-muted">
-                    ${item.unit_price.toFixed(2)} / {item.unit}
-                  </p>
-                </div>
-                <button onClick={() => handleToggleActive(item.id, !!item.active)}
-                  className="text-field-xs text-content-muted hover:text-content px-2 py-1 rounded transition-colors">
-                  {item.active ? 'Hide' : 'Show'}
-                </button>
-                <button onClick={() => handleDelete(item.id)}
-                  className="text-field-xs text-danger hover:text-red-300 px-2 py-1 rounded transition-colors">
-                  Delete
-                </button>
-              </div>
-            ))}
-          </div>
-        ))}
-
-        {items.length === 0 && !showForm && (
+        {jobs.length === 0 ? (
           <div className="flex flex-col items-center justify-center h-64 text-center px-8">
-            <p className="text-field-sm font-bold text-content-secondary">No items yet</p>
-            <p className="text-field-xs text-content-muted mt-1">Add your services and materials above</p>
+            <p className="text-field-sm font-bold text-content-secondary">No jobs</p>
+            <p className="text-field-xs text-content-muted mt-1">
+              {filter === 'all' ? 'Tap "+ New" to create your first job' : `No ${JOB_STATUS_LABELS[filter as JobStatus] ?? filter} jobs`}
+            </p>
+          </div>
+        ) : (
+          <div className="p-4 space-y-2">
+            {jobs.map(j => (
+              <JobCard
+                key={j.job.id}
+                {...j}
+                onPress={() => navigate(`/jobs/${j.job.id}`)}
+              />
+            ))}
           </div>
         )}
       </div>
@@ -1027,176 +412,613 @@ export default function PriceBookPage() {
 }
 ```
 
-Add route to `apps/pwa/src/App.tsx`:
-```tsx
-const PriceBookPage = lazy(() => import('./pages/settings/PriceBookPage'));
-// Add route inside AuthenticatedShell:
-<Route path="/settings/price-book" element={<PriceBookPage />} />
-```
-
-Add link in `SettingsPage.tsx` (find the settings menu list and add):
-```tsx
-{ label: 'Price Book', path: '/settings/price-book', icon: '📋' }
-```
-
 ---
 
-## TASK 11 — Add Inngest event key secret
+## TASK 8 — Build JobDetailPage (most important task)
 
-The `trigger-repuguard` function and `stripe-webhook` both need `INNGEST_EVENT_KEY` and `INNGEST_EVENT_URL`:
-```bash
-supabase secrets set INNGEST_EVENT_KEY=your-inngest-event-key
-supabase secrets set INNGEST_EVENT_URL=https://inn.gs/e
-```
+This page handles both creating new jobs (`mode="new"`) and editing existing ones (`mode="edit"`).
+It also triggers RepuGuard when a job is marked complete.
 
-Verify `inngest/serve.ts` has `INNGEST_SIGNING_KEY` set in its environment:
-```bash
-# In the Railway/Fly deployment env vars:
-INNGEST_SIGNING_KEY=signkey-prod-...
-INNGEST_EVENT_KEY=...
-SUPABASE_URL=...
-SUPABASE_SERVICE_ROLE_KEY=...
-ANTHROPIC_API_KEY=...
-RESEND_API_KEY=...
-TELNYX_API_KEY=...
-```
+Replace `apps/pwa/src/pages/JobDetailPage.tsx` entirely:
 
----
+```tsx
+import React, { useState, useEffect } from 'react';
+import { useNavigate, useParams } from 'react-router-dom';
+import { PageHeader, Button, Field, Input, Section, Card, useReactiveQuery } from '@trades-saas/core-ui';
+import type { JobStatus, TradeType } from '@trades-saas/core-types';
+import { JOB_STATUS_LABELS, JOB_STATUS_ORDER, canAdvanceStatus } from '@trades-saas/core-types';
+import { STATUS_COLORS } from '@trades-saas/core-ui';
+import { getSupabaseClient } from '@trades-saas/core-auth';
+import { useAuth } from '../providers';
 
-## TASK 12 — Add inngest/package.json for the serve server
+const supabase = getSupabaseClient();
 
-Check if `inngest/package.json` exists. If not, create it:
+// ─── Status badge ──────────────────────────────────────────────────────────────
 
-```json
-{
-  "name": "@trades-saas/inngest-server",
-  "version": "0.0.1",
-  "private": true,
-  "main": "serve.ts",
-  "scripts": {
-    "dev":   "tsx watch serve.ts",
-    "start": "tsx serve.ts",
-    "build": "tsc"
-  },
-  "dependencies": {
-    "@anthropic-ai/sdk":    "^0.24.0",
-    "@supabase/supabase-js": "^2.0.0",
-    "express":              "^4.18.0",
-    "inngest":              "^4.0.0",
-    "resend":               "^3.0.0"
-  },
-  "devDependencies": {
-    "@types/express": "^4.17.0",
-    "tsx":            "^4.0.0",
-    "typescript":     "^5.4.0"
+function StatusBadge({ status }: { status: JobStatus }) {
+  const colors = STATUS_COLORS[status as keyof typeof STATUS_COLORS] ?? STATUS_COLORS.lead;
+  return (
+    <span
+      className="text-field-xs font-bold px-2.5 py-1 rounded-badge capitalize"
+      style={{ background: colors.bg, color: colors.text, border: `1px solid ${colors.border}` }}
+    >
+      {JOB_STATUS_LABELS[status] ?? status}
+    </span>
+  );
+}
+
+// ─── Customer picker ──────────────────────────────────────────────────────────
+
+interface CustomerRow { id: string; name: string; phone: string | null; }
+
+function CustomerPicker({
+  value, orgId, onChange,
+}: { value: string; orgId: string; onChange: (id: string, name: string) => void }) {
+  const [search, setSearch] = useState('');
+  const [open,   setOpen]   = useState(false);
+
+  const { data: customers } = useReactiveQuery<CustomerRow>(
+    `SELECT id, name, phone FROM customers WHERE org_id = ?
+     AND (LOWER(name) LIKE LOWER(?) OR phone LIKE ?)
+     ORDER BY name LIMIT 20`,
+    [orgId, `%${search}%`, `%${search}%`]
+  );
+
+  const { data: selected } = useReactiveQuery<CustomerRow>(
+    `SELECT id, name, phone FROM customers WHERE id = ? LIMIT 1`,
+    [value]
+  );
+  const selectedCustomer = selected?.[0];
+
+  return (
+    <div className="relative">
+      <button
+        type="button"
+        onClick={() => setOpen(o => !o)}
+        className="w-full text-left bg-surface-sunken text-content text-field-sm rounded-input px-3 py-2.5
+                   border border-surface-border focus:border-brand outline-none h-touch"
+      >
+        {selectedCustomer ? (
+          <span className="text-content">{selectedCustomer.name}</span>
+        ) : (
+          <span className="text-content-muted">Select customer...</span>
+        )}
+      </button>
+
+      {open && (
+        <div className="absolute top-full left-0 right-0 z-50 bg-surface-raised border border-surface-border rounded-card shadow-raised mt-1 max-h-60 overflow-y-auto">
+          <div className="p-2 border-b border-surface-border">
+            <input
+              autoFocus
+              type="search"
+              value={search}
+              onChange={e => setSearch(e.target.value)}
+              placeholder="Search customers..."
+              className="w-full bg-surface-sunken text-content text-field-sm rounded px-3 py-2
+                         border border-surface-border focus:border-brand outline-none placeholder:text-content-muted"
+            />
+          </div>
+          {customers.length === 0 ? (
+            <p className="text-field-xs text-content-muted text-center py-4">No customers found</p>
+          ) : (
+            customers.map(c => (
+              <button
+                key={c.id}
+                type="button"
+                onClick={() => { onChange(c.id, c.name); setOpen(false); setSearch(''); }}
+                className="w-full text-left px-3 py-2.5 hover:bg-surface-raised transition-colors border-b border-surface-border/50 last:border-0"
+              >
+                <p className="text-field-sm text-content">{c.name}</p>
+                {c.phone && <p className="text-field-xs text-content-muted">{c.phone}</p>}
+              </button>
+            ))
+          )}
+        </div>
+      )}
+    </div>
+  );
+}
+
+// ─── Main page ────────────────────────────────────────────────────────────────
+
+interface JobRow {
+  id: string; org_id: string; customer_id: string; title: string;
+  description: string | null; status: string; source: string;
+  assigned_to: string | null; location: string | null; trade_type: string | null;
+  scheduled_at: string | null; completed_at: string | null;
+  estimated_value_cents: number | null; final_value_cents: number | null;
+  job_number: string; created_at: string; updated_at: string;
+  customer_name: string | null;
+}
+
+export default function JobDetailPage({ mode }: { mode?: 'new' | 'edit' }) {
+  const navigate    = useNavigate();
+  const { id }      = useParams<{ id: string }>();
+  const { user, org } = useAuth();
+  const orgId       = org?.id ?? '';
+  const isNew       = mode === 'new' || !id;
+
+  // Load existing job if editing
+  const { data: jobRows } = useReactiveQuery<JobRow>(
+    `SELECT j.*, c.name AS customer_name
+     FROM jobs j
+     LEFT JOIN customers c ON c.id = j.customer_id
+     WHERE j.id = ? AND j.org_id = ? LIMIT 1`,
+    [id ?? '', orgId]
+  );
+  const existingJob = isNew ? null : (jobRows?.[0] ?? null);
+
+  // Form state
+  const [title,       setTitle]       = useState('');
+  const [customerId,  setCustomerId]  = useState('');
+  const [customerName, setCustomerName] = useState('');
+  const [description, setDescription] = useState('');
+  const [location,    setLocation]    = useState('');
+  const [tradeType,   setTradeType]   = useState<TradeType | ''>('');
+  const [scheduledAt, setScheduledAt] = useState('');
+  const [saving,      setSaving]      = useState(false);
+  const [error,       setError]       = useState<string | null>(null);
+
+  // Populate form when editing
+  useEffect(() => {
+    if (!existingJob) return;
+    setTitle(existingJob.title);
+    setCustomerId(existingJob.customer_id);
+    setCustomerName(existingJob.customer_name ?? '');
+    setDescription(existingJob.description ?? '');
+    setLocation(existingJob.location ?? '');
+    setTradeType((existingJob.trade_type as TradeType | null) ?? '');
+    setScheduledAt(existingJob.scheduled_at ? existingJob.scheduled_at.slice(0, 16) : '');
+  }, [existingJob?.id]);
+
+  const TRADE_TYPES: { value: TradeType | ''; label: string }[] = [
+    { value: '',                  label: 'Select trade...' },
+    { value: 'hvac',              label: 'HVAC'            },
+    { value: 'plumbing',          label: 'Plumbing'        },
+    { value: 'electrical',        label: 'Electrical'      },
+    { value: 'roofing',           label: 'Roofing'         },
+    { value: 'general_contractor',label: 'General Contractor' },
+    { value: 'landscaping',       label: 'Landscaping'     },
+    { value: 'painting',          label: 'Painting'        },
+    { value: 'flooring',          label: 'Flooring'        },
+    { value: 'pest_control',      label: 'Pest Control'    },
+    { value: 'other',             label: 'Other'           },
+  ];
+
+  async function handleSave() {
+    if (!title.trim()) { setError('Job title is required'); return; }
+    if (!customerId)   { setError('Please select a customer'); return; }
+    setSaving(true);
+    setError(null);
+
+    try {
+      if (isNew) {
+        const { data: newJob, error: err } = await supabase.from('jobs').insert({
+          org_id:      orgId,
+          customer_id: customerId,
+          title:       title.trim(),
+          description: description.trim() || null,
+          location:    location.trim() || null,
+          trade_type:  tradeType || null,
+          scheduled_at: scheduledAt || null,
+          status:      'lead',
+          source:      'manual',
+          assigned_to: user?.id ?? null,
+        }).select().single();
+
+        if (err) throw err;
+        navigate(`/jobs/${newJob.id}`, { replace: true });
+      } else {
+        const { error: err } = await supabase.from('jobs').update({
+          title:       title.trim(),
+          description: description.trim() || null,
+          location:    location.trim() || null,
+          trade_type:  tradeType || null,
+          scheduled_at: scheduledAt || null,
+        }).eq('id', id!).eq('org_id', orgId);
+
+        if (err) throw err;
+      }
+    } catch (e) {
+      setError(e instanceof Error ? e.message : 'Failed to save job');
+    } finally {
+      setSaving(false);
+    }
   }
-}
-```
 
-Also verify `inngest/tsconfig.json` exists:
-```json
-{
-  "extends": "../tsconfig.base.json",
-  "compilerOptions": {
-    "module": "CommonJS",
-    "outDir": "./dist",
-    "rootDir": "."
-  },
-  "include": ["./**/*.ts"]
+  async function handleAdvanceStatus() {
+    if (!existingJob) return;
+    const currentStatus = existingJob.status as JobStatus;
+    const nextStatus    = canAdvanceStatus(currentStatus);
+    if (!nextStatus) return;
+
+    setSaving(true);
+    try {
+      const updates: Record<string, unknown> = { status: nextStatus };
+      if (nextStatus === 'complete') updates.completed_at = new Date().toISOString();
+
+      const { error: err } = await supabase
+        .from('jobs')
+        .update(updates)
+        .eq('id', existingJob.id)
+        .eq('org_id', orgId);
+
+      if (err) throw err;
+
+      // Fire RepuGuard when job reaches 'complete'
+      if (nextStatus === 'complete' && existingJob.customer_id) {
+        const { data: { session } } = await supabase.auth.getSession();
+        fetch(
+          `${import.meta.env.VITE_SUPABASE_URL}/functions/v1/trigger-repuguard`,
+          {
+            method: 'POST',
+            headers: {
+              'Authorization': `Bearer ${session?.access_token}`,
+              'Content-Type': 'application/json',
+            },
+            body: JSON.stringify({
+              job_id:      existingJob.id,
+              customer_id: existingJob.customer_id,
+              org_id:      orgId,
+            }),
+          }
+        ).catch(console.error); // fire-and-forget
+      }
+    } catch (e) {
+      setError(e instanceof Error ? e.message : 'Failed to update status');
+    } finally {
+      setSaving(false);
+    }
+  }
+
+  async function handleCancel() {
+    if (!existingJob) return;
+    if (!confirm('Cancel this job?')) return;
+    await supabase.from('jobs').update({ status: 'cancelled' }).eq('id', existingJob.id);
+    navigate('/jobs');
+  }
+
+  const currentStatus = (existingJob?.status as JobStatus | undefined) ?? 'lead';
+  const nextStatus    = canAdvanceStatus(currentStatus);
+
+  return (
+    <div className="flex flex-col min-h-full bg-surface pb-8">
+      <PageHeader
+        title={isNew ? 'New Job' : (existingJob?.job_number ?? 'Job')}
+        subtitle={isNew ? undefined : existingJob?.title}
+        onBack={() => navigate(-1)}
+        actions={
+          existingJob ? <StatusBadge status={currentStatus} /> : undefined
+        }
+      />
+
+      {error && (
+        <div className="mx-4 mt-3 p-3 bg-surface-raised border border-danger/20 rounded-card">
+          <p className="text-field-xs text-danger">{error}</p>
+        </div>
+      )}
+
+      {/* Status advance — only on existing jobs */}
+      {existingJob && nextStatus && (
+        <div className="px-4 pt-4">
+          <Button
+            variant="primary"
+            fullWidth
+            loading={saving}
+            onClick={handleAdvanceStatus}
+          >
+            Mark as {JOB_STATUS_LABELS[nextStatus]} →
+          </Button>
+        </div>
+      )}
+
+      {/* Job form */}
+      <Section title="Job Details" className="pt-4">
+        <Card elevation="raised" padding="md">
+          <div className="space-y-4">
+            <Field label="Job Title *">
+              <Input
+                value={title}
+                onChange={e => setTitle(e.target.value)}
+                placeholder="e.g. AC replacement + tune-up"
+              />
+            </Field>
+
+            <Field label="Customer *">
+              <CustomerPicker
+                value={customerId}
+                orgId={orgId}
+                onChange={(id, name) => { setCustomerId(id); setCustomerName(name); }}
+              />
+            </Field>
+
+            <Field label="Trade Type">
+              <select
+                value={tradeType}
+                onChange={e => setTradeType(e.target.value as TradeType | '')}
+                className="w-full bg-surface-sunken text-content text-field-sm rounded-input px-3 py-2.5
+                           border border-surface-border focus:border-brand outline-none h-touch"
+              >
+                {TRADE_TYPES.map(t => (
+                  <option key={t.value} value={t.value}>{t.label}</option>
+                ))}
+              </select>
+            </Field>
+
+            <Field label="Scheduled Date & Time">
+              <input
+                type="datetime-local"
+                value={scheduledAt}
+                onChange={e => setScheduledAt(e.target.value)}
+                className="w-full bg-surface-sunken text-content text-field-sm rounded-input px-3 py-2.5
+                           border border-surface-border focus:border-brand outline-none h-touch"
+              />
+            </Field>
+
+            <Field label="Location / Address">
+              <Input
+                value={location}
+                onChange={e => setLocation(e.target.value)}
+                placeholder="123 Main St, City, ST"
+              />
+            </Field>
+
+            <Field label="Description">
+              <textarea
+                value={description}
+                onChange={e => setDescription(e.target.value)}
+                placeholder="Details about the job..."
+                rows={3}
+                className="w-full bg-surface-sunken text-content text-field-sm rounded-input px-3 py-2.5
+                           border border-surface-border focus:border-brand outline-none resize-none
+                           placeholder:text-content-muted"
+              />
+            </Field>
+          </div>
+        </Card>
+      </Section>
+
+      {/* Save button */}
+      <div className="px-4 pt-2">
+        <Button
+          variant={isNew ? 'primary' : 'secondary'}
+          fullWidth
+          loading={saving}
+          onClick={handleSave}
+        >
+          {isNew ? 'Create Job' : 'Save Changes'}
+        </Button>
+      </div>
+
+      {/* Cancel job — only for non-terminal existing jobs */}
+      {existingJob && !['closed', 'cancelled'].includes(currentStatus) && (
+        <div className="px-4 pt-2">
+          <Button variant="ghost" fullWidth onClick={handleCancel}>
+            Cancel Job
+          </Button>
+        </div>
+      )}
+    </div>
+  );
 }
 ```
 
 ---
 
-## TASK 13 — PWA icons
+## TASK 9 — Build CustomersPage
 
-The `vite.config.ts` PWA manifest references `/icons/icon-192.png` and `/icons/icon-512.png`.
-Create `apps/pwa/public/icons/` directory.
+Replace `apps/pwa/src/pages/CustomersPage.tsx` entirely:
 
-Generate two placeholder PNG icons programmatically — an orange square (`#FF6600`) with a white "TS" text. Use a canvas-based script or create simple colored PNG placeholders.
+```tsx
+import React, { useState } from 'react';
+import { useNavigate } from 'react-router-dom';
+import { PageHeader, Button, Section, Card, useReactiveQuery } from '@trades-saas/core-ui';
+import { getSupabaseClient } from '@trades-saas/core-auth';
+import { useAuth } from '../providers';
 
-The simplest approach: create a Node script at `scripts/generate-icons.mjs`:
-```javascript
-import { createCanvas } from 'canvas';
-import { writeFileSync, mkdirSync } from 'fs';
+const supabase = getSupabaseClient();
 
-function makeIcon(size) {
-  const canvas = createCanvas(size, size);
-  const ctx    = canvas.getContext('2d');
-  // Background
-  ctx.fillStyle = '#FF6600';
-  ctx.fillRect(0, 0, size, size);
-  // Text
-  ctx.fillStyle = '#FFFFFF';
-  ctx.font      = `bold ${Math.floor(size * 0.35)}px sans-serif`;
-  ctx.textAlign = 'center';
-  ctx.textBaseline = 'middle';
-  ctx.fillText('TS', size / 2, size / 2);
-  return canvas.toBuffer('image/png');
+interface CustomerRow {
+  id: string; name: string; phone: string | null; email: string | null;
+  address: string | null; notes: string | null; created_at: string;
+  job_count: number; open_job_count: number;
 }
 
-mkdirSync('apps/pwa/public/icons', { recursive: true });
-writeFileSync('apps/pwa/public/icons/icon-192.png', makeIcon(192));
-writeFileSync('apps/pwa/public/icons/icon-512.png', makeIcon(512));
-console.log('Icons generated.');
-```
+function formatPhone(phone: string | null) {
+  if (!phone) return null;
+  return phone.replace(/^\+1(\d{3})(\d{3})(\d{4})$/, '($1) $2-$3') ?? phone;
+}
 
-Run:
-```bash
-pnpm add -w canvas
-node scripts/generate-icons.mjs
-```
+export default function CustomersPage() {
+  const navigate = useNavigate();
+  const { org }  = useAuth();
+  const orgId    = org?.id ?? '';
+  const [search, setSearch] = useState('');
+  const [showNew, setShowNew] = useState(false);
 
-If `canvas` is unavailable in the environment, create the smallest valid PNG files manually using a data URL approach or copy any 192×192 and 512×512 PNG placeholders into the directory. The icons must exist for the PWA manifest to validate.
+  // New customer form
+  const [form, setForm] = useState({ name: '', phone: '', email: '', address: '' });
+  const [saving, setSaving] = useState(false);
+  const [error,  setError]  = useState<string | null>(null);
+
+  const { data: customers } = useReactiveQuery<CustomerRow>(`
+    SELECT
+      c.*,
+      COUNT(j.id)                                                     AS job_count,
+      COUNT(CASE WHEN j.status NOT IN ('closed','cancelled') THEN 1 END) AS open_job_count
+    FROM customers c
+    LEFT JOIN jobs j ON j.customer_id = c.id
+    WHERE c.org_id = ?
+      ${search ? `AND (LOWER(c.name) LIKE LOWER('%${search}%') OR c.phone LIKE '%${search}%' OR LOWER(c.email) LIKE LOWER('%${search}%'))` : ''}
+    GROUP BY c.id
+    ORDER BY c.name ASC
+    LIMIT 100
+  `, [orgId]);
+
+  async function handleCreate() {
+    if (!form.name.trim()) { setError('Name is required'); return; }
+    setSaving(true);
+    setError(null);
+    try {
+      const { error: err } = await supabase.from('customers').insert({
+        org_id:  orgId,
+        name:    form.name.trim(),
+        phone:   form.phone.trim() || null,
+        email:   form.email.trim() || null,
+        address: form.address.trim() || null,
+      });
+      if (err) throw err;
+      setForm({ name: '', phone: '', email: '', address: '' });
+      setShowNew(false);
+    } catch (e) {
+      setError(e instanceof Error ? e.message : 'Failed to create customer');
+    } finally {
+      setSaving(false);
+    }
+  }
+
+  return (
+    <div className="flex flex-col h-full bg-surface">
+      <PageHeader
+        title="Customers"
+        actions={
+          <Button variant="primary" size="sm" onClick={() => setShowNew(n => !n)}>
+            {showNew ? 'Cancel' : '+ New'}
+          </Button>
+        }
+      />
+
+      {/* New customer form */}
+      {showNew && (
+        <div className="px-4 py-4 border-b border-surface-border bg-surface-raised space-y-3">
+          <p className="text-field-xs font-bold text-content-secondary uppercase tracking-widest">
+            New Customer
+          </p>
+          {error && <p className="text-field-xs text-danger">{error}</p>}
+          {[
+            { key: 'name',    label: 'Name *',    type: 'text',  placeholder: 'John Smith'           },
+            { key: 'phone',   label: 'Phone',     type: 'tel',   placeholder: '+15551234567'          },
+            { key: 'email',   label: 'Email',     type: 'email', placeholder: 'john@example.com'     },
+            { key: 'address', label: 'Address',   type: 'text',  placeholder: '123 Main St'          },
+          ].map(({ key, label, type, placeholder }) => (
+            <div key={key}>
+              <label className="block text-field-xs font-semibold text-content-secondary mb-1">{label}</label>
+              <input
+                type={type}
+                value={(form as any)[key]}
+                onChange={e => setForm(f => ({ ...f, [key]: e.target.value }))}
+                placeholder={placeholder}
+                className="w-full bg-surface-sunken text-content text-field-sm rounded-input px-3 py-2.5
+                           border border-surface-border focus:border-brand outline-none placeholder:text-content-muted"
+              />
+            </div>
+          ))}
+          <Button variant="primary" fullWidth loading={saving} onClick={handleCreate}>
+            Create Customer
+          </Button>
+        </div>
+      )}
+
+      {/* Search */}
+      <div className="px-4 py-3 border-b border-surface-border">
+        <input
+          type="search"
+          value={search}
+          onChange={e => setSearch(e.target.value)}
+          placeholder="Search by name, phone, email…"
+          className="w-full bg-surface-sunken text-content text-field-sm rounded-input px-3 py-2.5
+                     border border-surface-border focus:border-brand outline-none placeholder:text-content-muted"
+        />
+      </div>
+
+      {/* Customer list */}
+      <div className="flex-1 overflow-y-auto divide-y divide-surface-border">
+        {customers.length === 0 ? (
+          <div className="flex flex-col items-center justify-center h-64 text-center px-8">
+            <p className="text-field-sm font-bold text-content-secondary">
+              {search ? 'No customers match your search' : 'No customers yet'}
+            </p>
+            <p className="text-field-xs text-content-muted mt-1">
+              {!search && 'Tap "+ New" to add your first customer'}
+            </p>
+          </div>
+        ) : (
+          customers.map(customer => (
+            <button
+              key={customer.id}
+              onClick={() => navigate(`/jobs?customer=${customer.id}`)}
+              className="w-full text-left px-4 py-3.5 hover:bg-surface-raised active:bg-surface-raised/80 transition-colors"
+            >
+              <div className="flex items-start justify-between gap-3">
+                <div className="flex-1 min-w-0">
+                  <p className="text-field-sm font-semibold text-content truncate">{customer.name}</p>
+                  {customer.phone && (
+                    <p className="text-field-xs text-content-secondary mt-0.5">
+                      {formatPhone(customer.phone)}
+                    </p>
+                  )}
+                  {customer.email && (
+                    <p className="text-field-xs text-content-muted truncate">{customer.email}</p>
+                  )}
+                </div>
+                <div className="text-right shrink-0">
+                  {customer.open_job_count > 0 ? (
+                    <span className="text-field-xs font-bold text-brand">
+                      {customer.open_job_count} open job{customer.open_job_count !== 1 ? 's' : ''}
+                    </span>
+                  ) : (
+                    <span className="text-field-xs text-content-muted">
+                      {customer.job_count} job{customer.job_count !== 1 ? 's' : ''}
+                    </span>
+                  )}
+                </div>
+              </div>
+            </button>
+          ))
+        )}
+      </div>
+    </div>
+  );
+}
+```
 
 ---
 
-## TASK 14 — Final checks
+## TASK 10 — Final checks
 
 ```bash
-# Install all deps
+# Clean install
 pnpm install
 
-# Type-check everything — fix all errors before finishing
+# Type-check everything — fix every error
 pnpm turbo typecheck
 
-# Verify new files exist:
-ls -la supabase/functions/_shared/pdf.ts
-ls -la supabase/functions/omnibid-send-invoice/index.ts
-ls -la supabase/functions/trigger-repuguard/index.ts
-ls -la apps/pwa/src/pages/settings/PriceBookPage.tsx
-ls -la apps/pwa/public/icons/icon-192.png
-ls -la apps/pwa/public/icons/icon-512.png
-ls -la supabase/migrations/20260516_storage_documents.sql
-ls -la inngest/package.json
+# Verify stubs are gone — these should NOT contain "Coming in module build session":
+grep -l "Coming in module build session" apps/pwa/src/pages/*.tsx
+# Should return empty
 
-# Verify PDF env var is documented:
-grep -r "PDF_API_URL" supabase/functions/
+# Verify manifest.json is deleted:
+ls apps/pwa/public/manifest.json 2>/dev/null && echo "DELETE THIS FILE" || echo "OK — file removed"
 
-# Verify review_requests in AppSchema:
-grep -r "review_requests" packages/core-sync/src/schema.ts
+# Verify review delay default is 24, not 2:
+grep "review_delay_hours ?? " apps/pwa/src/pages/settings/SettingsPage.tsx
 
-# Deploy all new/updated Edge Functions:
-supabase functions deploy omnibid-send-estimate
-supabase functions deploy omnibid-send-invoice
-supabase functions deploy trigger-repuguard
+# Verify trigger-repuguard is called in JobDetailPage:
+grep "trigger-repuguard" apps/pwa/src/pages/JobDetailPage.tsx
 
-# Set required secrets:
-supabase secrets set PDF_API_URL=https://demo.gotenberg.dev
-supabase secrets set STRIPE_WEBHOOK_SECRET=whsec_...
-supabase secrets set INNGEST_EVENT_KEY=...
-supabase secrets set INNGEST_EVENT_URL=https://inn.gs/e
+# Build to catch any bundle errors:
+pnpm --filter @trades-saas/pwa build
 ```
 
 ---
 
 ## HARD RULES REMINDER
 
-- Package prefix: `@trades-saas/` only
-- Font: Inter only — no Sora, no DM Mono
-- Colors: token classes only — no hex in components
-- Reads: PowerSync `useQuery` only — never `supabase.from().select()` in components
-- Money: cents in DB, dollar display via `toLocaleString`
-- Edge Functions: Deno — `https://esm.sh/` imports only
-- Touch targets: 48px minimum
-- `set_updated_at()` already exists — never redefine it
+- `@trades-saas/` prefix only
+- Inter font only
+- Token classes only — no hex in components
+- PowerSync reads — never Supabase in components
+- Cents in DB, dollars in display
+- `set_updated_at()` exists — never redefine
+- Edge Functions: Deno with `https://esm.sh/` imports
+- 48px minimum touch targets
