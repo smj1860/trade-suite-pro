@@ -1,1013 +1,762 @@
-# CLAUDE.md — TradeSuite Phase 4
-> Execution file. Read completely then work top to bottom without pausing.
-> Phases 1-3 are confirmed complete. Phase 4 finishes the three core workflow stubs
-> and closes a handful of small bugs. After this the app is feature-complete.
+# CLAUDE.md — TradeSuite Phase 5 (Final Tweaking)
+> Execution file. Read completely, then work top to bottom.
+> The app builds clean and is feature-complete except for these three items.
+> After Phase 5 the product is ready for real users.
 
 ---
 
-## DO NOT RECREATE — CONFIRMED COMPLETE
+## DO NOT TOUCH — CONFIRMED COMPLETE
 
-Every file below is confirmed in the repo. Do not touch unless a task explicitly says to.
-
-```
-All core packages and migrations
-All supabase/functions/ (stripe-portal, stripe-webhook, omnibid-*, repuguard-*, trigger-repuguard, telnyx-webhook)
-supabase/functions/_shared/pdf.ts
-inngest/ (serve.ts, client.ts, all 3 functions)
-modules/leads/          ✓ complete
-modules/estimates/      ✓ complete
-modules/reviews/        ✓ complete
-apps/pwa/src/pages/auth/LoginPage.tsx         ✓
-apps/pwa/src/pages/CalendarPage.tsx           ✓ full implementation
-apps/pwa/src/pages/DashboardPage.tsx          ✓
-apps/pwa/src/pages/settings/SettingsPage.tsx  ✓ review links + price book link
-apps/pwa/src/pages/settings/PriceBookPage.tsx ✓ full CRUD with edit + search
-apps/pwa/src/pages/settings/BillingPage.tsx   ✓
-apps/pwa/src/providers/index.tsx              ✓
-apps/pwa/src/App.tsx                          ✓ all routes wired
-```
+Everything in the repo is working. Only modify files explicitly listed in a task below.
 
 ---
 
-## HARD RULES (never break)
+## HARD RULES
 
 - Package prefix: `@trades-saas/` only
 - Vite + React 18 — no Next.js
 - Font: Inter only
-- Colors: token classes only — `bg-brand`, `bg-surface`, `bg-surface-raised`, `bg-surface-sunken`, `bg-surface-border`, `text-content`, `text-content-secondary`, `text-content-muted`, `text-brand`, `text-success`, `text-warning`, `text-danger`, `text-info`
+- Colors: token classes only — `bg-brand`, `bg-surface`, `bg-surface-raised`, `bg-surface-sunken`, `text-content`, `text-content-secondary`, `text-content-muted`, `text-brand`, `text-success`, `text-warning`, `text-danger`
 - Reads: PowerSync `useReactiveQuery` or `useQuery` — never `supabase.from().select()` in components
 - Money: cents in DB — display with `(cents/100).toLocaleString('en-US',{style:'currency',currency:'USD'})`
-- `set_updated_at()` already exists — never redefine
-- Edge Functions: Deno — `https://esm.sh/` or `https://deno.land/` imports
 - Touch targets: 48px minimum (`h-touch`)
 
 ---
 
-# TASK LIST
+# TASK 1 — Customer filter in JobsPage (small fix)
 
----
+`CustomersPage` navigates to `/jobs?customer=${customer.id}` when a customer row is tapped, but `JobsPage` ignores the query param and shows all jobs.
 
-## TASK 1 — Fix manifest.json green theme (2 min)
+### 1a. Update `apps/pwa/src/pages/JobsPage.tsx`
 
-Delete `apps/pwa/public/manifest.json` entirely.
+Add `useSearchParams` import and read the customer filter:
 
-VitePWA generates the manifest automatically from `vite.config.ts` which already has the correct Safety Orange colors (`theme_color: '#FF6600'`, `background_color: '#1A1A1A'`). The static file was overriding it with the old green theme.
+```tsx
+import { useNavigate, useSearchParams } from 'react-router-dom';
 
-```bash
-rm apps/pwa/public/manifest.json
+// Inside JobsPage(), add:
+const [searchParams] = useSearchParams();
+const customerFilter = searchParams.get('customer'); // uuid or null
+```
+
+Update the PowerSync query to add a customer clause when the param is present:
+
+```tsx
+const customerClause = customerFilter ? `AND j.customer_id = '${customerFilter}'` : '';
+
+const { data: rows } = useReactiveQuery<JobRow>(`
+  SELECT
+    j.*,
+    c.name AS customer_name,
+    u.name AS assigned_to_name,
+    e.total_cents AS estimate_total_cents
+  FROM jobs j
+  LEFT JOIN customers  c ON c.id = j.customer_id
+  LEFT JOIN users      u ON u.id = j.assigned_to
+  LEFT JOIN estimates  e ON e.job_id = j.id AND e.status NOT IN ('declined', 'rejected', 'expired', 'superseded')
+  WHERE j.org_id = ?
+    AND j.${whereStatus}
+    ${customerClause}
+  ORDER BY
+    CASE j.status
+      WHEN 'active'    THEN 1
+      WHEN 'scheduled' THEN 2
+      WHEN 'lead'      THEN 3
+      WHEN 'complete'  THEN 4
+      WHEN 'closed'    THEN 5
+      ELSE 6
+    END,
+    j.scheduled_at ASC,
+    j.created_at DESC
+  LIMIT 100
+`, [orgId]);
+```
+
+Show a customer name header when filtering, and add a clear button:
+
+```tsx
+// Fetch the customer name when filtering
+const { data: customerRows } = useReactiveQuery<{ name: string }>(
+  customerFilter
+    ? `SELECT name FROM customers WHERE id = ? LIMIT 1`
+    : `SELECT '' AS name WHERE 0`,
+  customerFilter ? [customerFilter] : []
+);
+const customerName = customerRows?.[0]?.name;
+
+// Add above the filter tabs when customerFilter is set:
+{customerFilter && customerName && (
+  <div className="flex items-center justify-between px-4 py-2 bg-surface-raised border-b border-surface-border">
+    <p className="text-field-xs text-content-secondary">
+      Jobs for <span className="font-semibold text-content">{customerName}</span>
+    </p>
+    <button
+      onClick={() => navigate('/jobs')}
+      className="text-field-xs text-brand font-semibold touch-manipulation"
+    >
+      Clear
+    </button>
+  </div>
+)}
 ```
 
 ---
 
-## TASK 2 — Fix SettingsPage review delay default (1 min)
+# TASK 2 — Invoice creation UI
 
-In `apps/pwa/src/pages/settings/SettingsPage.tsx`, find:
+The estimate → invoice flow is fully built in the backend (`omnibid-send-invoice` Edge Function) but there is no "Convert to Invoice" button in the UI. This task adds it.
+
+## 2a. Add `createInvoice` to `modules/estimates/src/hooks/useEstimates.ts`
+
+Inside `useEstimateActions`, add:
+
 ```typescript
-const [delayHours, setDelayHours] = useState<number>((org as any)?.review_delay_hours ?? 2);
+const createInvoice = useCallback(async (estimateId: string): Promise<{ id: string }> => {
+  const { data: { session } } = await supabase.auth.getSession();
+
+  // Fetch the estimate to copy its values
+  const { data: est, error: estErr } = await supabase
+    .from('estimates')
+    .select('org_id, job_id, customer_id, subtotal_cents, tax_cents, tax_rate, total_cents, customer_note, created_by')
+    .eq('id', estimateId)
+    .single();
+  if (estErr || !est) throw new Error('Estimate not found');
+
+  // Create invoice record — status starts as 'draft'
+  const { data: inv, error: invErr } = await supabase
+    .from('invoices')
+    .insert({
+      org_id:         est.org_id,
+      job_id:         est.job_id,
+      customer_id:    est.customer_id,
+      created_by:     est.created_by,
+      estimate_id:    estimateId,
+      subtotal_cents: est.subtotal_cents,
+      tax_cents:      est.tax_cents,
+      tax_rate:       est.tax_rate,
+      total_cents:    est.total_cents,
+      balance_cents:  est.total_cents,
+      customer_note:  est.customer_note,
+      status:         'draft',
+    })
+    .select('id')
+    .single();
+  if (invErr || !inv) throw new Error(invErr?.message ?? 'Failed to create invoice');
+
+  // Mark estimate as invoiced
+  await supabase.from('estimates').update({ status: 'superseded' }).eq('id', estimateId);
+
+  return { id: inv.id };
+}, []);
+
+const sendInvoice = useCallback(async (invoiceId: string): Promise<{ pdf_url: string; payment_link_url: string }> => {
+  const { data: { session } } = await supabase.auth.getSession();
+  const res = await fetch(
+    `${(import.meta as any).env.VITE_SUPABASE_URL}/functions/v1/omnibid-send-invoice`,
+    {
+      method: 'POST',
+      headers: {
+        'Authorization': `Bearer ${session?.access_token}`,
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify({ invoice_id: invoiceId }),
+    }
+  );
+  if (!res.ok) throw new Error(await res.text());
+  return res.json() as Promise<{ pdf_url: string; payment_link_url: string }>;
+}, []);
 ```
 
-Change `?? 2` to `?? 24`:
+Return both from `useEstimateActions`.
+
+## 2b. Add hooks to read invoices
+
+In `modules/estimates/src/hooks/useEstimates.ts`, add:
+
 ```typescript
-const [delayHours, setDelayHours] = useState<number>((org as any)?.review_delay_hours ?? 24);
+export function useInvoice(invoiceId: string) {
+  return useQuery<Invoice>(
+    'SELECT * FROM invoices WHERE id = ? LIMIT 1',
+    [invoiceId]
+  );
+}
+
+export function useJobInvoices(jobId: string) {
+  return useQuery<Invoice>(
+    'SELECT * FROM invoices WHERE job_id = ? ORDER BY created_at DESC',
+    [jobId]
+  );
+}
+```
+
+Add the `Invoice` type to `modules/estimates/src/types.ts` if it doesn't exist:
+
+```typescript
+export type InvoiceStatus = 'draft' | 'sent' | 'viewed' | 'partial' | 'paid' | 'overdue' | 'void';
+
+export interface Invoice {
+  id: string;
+  org_id: string;
+  job_id: string;
+  customer_id: string;
+  created_by: string;
+  estimate_id: string | null;
+  invoice_number: string;
+  status: InvoiceStatus;
+  subtotal_cents: number;
+  tax_cents: number;
+  tax_rate: number;
+  total_cents: number;
+  balance_cents: number;
+  due_date: string | null;
+  sent_at: string | null;
+  viewed_at: string | null;
+  paid_at: string | null;
+  payment_link_url: string | null;
+  view_token: string | null;
+  customer_note: string | null;
+  created_at: string;
+  updated_at: string;
+}
+```
+
+Export the new types and hooks from `modules/estimates/src/index.ts`.
+
+## 2c. Add "Convert to Invoice" button to EstimateDetailPage
+
+Open `modules/estimates/src/pages/EstimateDetailPage.tsx`.
+
+Add state and the `createInvoice`/`sendInvoice` actions to the existing destructuring from `useEstimateActions`.
+
+After the existing `sending` state, add:
+```typescript
+const [converting, setConverting] = useState(false);
+const [invoiceId,  setInvoiceId]  = useState<string | null>(null);
+const [sendingInv, setSendingInv] = useState(false);
+const { createInvoice, sendInvoice } = useEstimateActions();
+```
+
+Add a handler:
+```typescript
+async function handleConvertToInvoice() {
+  if (!estimate || converting) return;
+  setConverting(true);
+  try {
+    const { id } = await createInvoice(estimate.id);
+    setInvoiceId(id);
+  } catch (err) {
+    console.error('Convert to invoice failed:', err);
+  } finally {
+    setConverting(false);
+  }
+}
+
+async function handleSendInvoice() {
+  if (!invoiceId || sendingInv) return;
+  setSendingInv(true);
+  try {
+    await sendInvoice(invoiceId);
+  } finally {
+    setSendingInv(false);
+  }
+}
+```
+
+In the render, find where the "Send Estimate" button is shown (`isDraft` check).
+Add a second action area for accepted estimates — show this when `estimate.status === 'accepted'`:
+
+```tsx
+{estimate.status === 'accepted' && !invoiceId && (
+  <div className="p-4 border-t border-surface-border">
+    <button
+      onClick={handleConvertToInvoice}
+      disabled={converting}
+      className="w-full h-touch bg-brand text-white font-bold text-field-sm rounded-button
+                 hover:bg-brand-mid active:scale-[0.99] transition-all disabled:opacity-40
+                 flex items-center justify-center gap-2"
+    >
+      {converting ? (
+        <span className="w-5 h-5 border-2 border-white/30 border-t-white rounded-full animate-spin" />
+      ) : (
+        <>
+          <svg className="w-5 h-5" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
+            <path strokeLinecap="round" strokeLinejoin="round" d="M9 12h6m-6 4h6m2 5H7a2 2 0 01-2-2V5a2 2 0 012-2h5.586a1 1 0 01.707.293l5.414 5.414a1 1 0 01.293.707V19a2 2 0 01-2 2z" />
+          </svg>
+          Convert to Invoice
+        </>
+      )}
+    </button>
+  </div>
+)}
+
+{invoiceId && (
+  <div className="p-4 border-t border-surface-border space-y-2">
+    <div className="bg-surface-raised border border-success/20 rounded-card px-4 py-3">
+      <p className="text-field-xs text-success font-semibold">Invoice created</p>
+      <p className="text-field-xs text-content-muted mt-0.5">Send it to the customer to collect payment</p>
+    </div>
+    <button
+      onClick={handleSendInvoice}
+      disabled={sendingInv}
+      className="w-full h-touch bg-brand text-white font-bold text-field-sm rounded-button
+                 hover:bg-brand-mid active:scale-[0.99] transition-all disabled:opacity-40
+                 flex items-center justify-center gap-2"
+    >
+      {sendingInv ? (
+        <span className="w-5 h-5 border-2 border-white/30 border-t-white rounded-full animate-spin" />
+      ) : 'Send Invoice & Payment Link'}
+    </button>
+  </div>
+)}
 ```
 
 ---
 
-## TASK 3 — Verify/fix Storage bucket migration
+# TASK 3 — Job notes and photos in JobDetailPage
 
-Check if `supabase/migrations/20260516_storage_documents.sql` exists:
-```bash
-ls supabase/migrations/20260516_storage_documents.sql
-```
+The schema, PowerSync sync, and all types are already in place. This task adds the UI.
 
-If it does NOT exist, create it:
+## 3a. Add a Supabase Storage bucket for job photos
+
+Create `supabase/migrations/20260517_storage_photos.sql`:
+
 ```sql
--- Storage bucket for estimate and invoice PDFs
 INSERT INTO storage.buckets (id, name, public, file_size_limit, allowed_mime_types)
 VALUES (
-  'documents', 'documents', false, 10485760, ARRAY['application/pdf']
+  'job-photos',
+  'job-photos',
+  false,
+  52428800,   -- 50MB per photo
+  ARRAY['image/jpeg', 'image/png', 'image/webp', 'image/heic']
 )
 ON CONFLICT (id) DO NOTHING;
 
-CREATE POLICY "documents_org_read" ON storage.objects
+CREATE POLICY "photos_org_read" ON storage.objects
   FOR SELECT USING (
-    bucket_id = 'documents'
+    bucket_id = 'job-photos'
     AND (storage.foldername(name))[1] = (
       SELECT org_id::text FROM public.users WHERE id = auth.uid() LIMIT 1
     )
   );
 
-CREATE POLICY "documents_service_write" ON storage.objects
-  FOR INSERT TO service_role WITH CHECK (bucket_id = 'documents');
+CREATE POLICY "photos_org_insert" ON storage.objects
+  FOR INSERT WITH CHECK (
+    bucket_id = 'job-photos'
+    AND (storage.foldername(name))[1] = (
+      SELECT org_id::text FROM public.users WHERE id = auth.uid() LIMIT 1
+    )
+  );
 
-CREATE POLICY "documents_service_update" ON storage.objects
-  FOR UPDATE TO service_role USING (bucket_id = 'documents');
+CREATE POLICY "photos_org_delete" ON storage.objects
+  FOR DELETE USING (
+    bucket_id = 'job-photos'
+    AND (storage.foldername(name))[1] = (
+      SELECT org_id::text FROM public.users WHERE id = auth.uid() LIMIT 1
+    )
+  );
 ```
 
----
-
-## TASK 4 — Verify/fix review_requests in AppSchema and sync rules
-
-### 4a. Check `packages/core-sync/src/schema.ts`
-
-Search for `review_requests` in the AppSchema export. If missing, add this table definition and include it in the AppSchema:
-
-```typescript
-const review_requests = new Table(
-  {
-    org_id:        column.text,
-    job_id:        column.text,
-    customer_id:   column.text,
-    status:        column.text,
-    sent_via:      column.text,
-    platform:      column.text,
-    review_url:    column.text,
-    sent_at:       column.text,
-    clicked_at:    column.text,
-    reviewed_at:   column.text,
-    star_rating:   column.integer,
-    review_text:   column.text,
-    inngest_run_id: column.text,
-    created_at:    column.text,
-    updated_at:    column.text,
-  },
-  { indexes: { by_status: ['status', 'created_at'] } }
-);
-// Add review_requests to the AppSchema export object
-```
-
-### 4b. Check `packages/core-sync/sync-rules.yaml`
-
-If `review_requests` is not in the data section, add it:
-```yaml
-- SELECT * FROM review_requests WHERE org_id = bucket.org_id
-```
-
----
-
-## TASK 5 — Fix is_customer_facing column in estimate send function
-
-Open `supabase/functions/omnibid-send-estimate/index.ts`. Find this line in `buildEstimateHtml`:
-```typescript
-.filter((i: any) => i.is_customer_facing)
-```
-
-Check `modules/estimates/supabase/migrations/0001_omnibid_schema.sql` to see if `is_customer_facing` column exists on `estimate_line_items`.
-
-**If the column does NOT exist**, remove the filter so all line items are included:
-```typescript
-// Remove the .filter line — show all items
-const rows = items
-  .map((item: any) => `...`)
-  .join('');
-```
-
-**If the column DOES exist**, keep the filter as-is.
-
----
-
-## TASK 6 — Add ForgotPasswordPage stub
-
-`LoginPage.tsx` navigates to `/auth/forgot-password` but this page doesn't exist, causing a crash if the user taps "Forgot your password?".
-
-Create `apps/pwa/src/pages/auth/ForgotPasswordPage.tsx`:
+## 3b. Create `apps/pwa/src/components/JobNotes.tsx`
 
 ```tsx
-import React, { useState } from 'react';
-import { useNavigate } from 'react-router-dom';
-import { Button, Field, Input } from '@trades-saas/core-ui';
+import React, { useRef, useState } from 'react';
+import { useReactiveQuery } from '@trades-saas/core-ui';
 import { getSupabaseClient } from '@trades-saas/core-auth';
+import { formatDistanceToNow } from 'date-fns';
 
 const supabase = getSupabaseClient();
 
-export default function ForgotPasswordPage() {
-  const navigate = useNavigate();
-  const [email,   setEmail]   = useState('');
-  const [loading, setLoading] = useState(false);
-  const [sent,    setSent]    = useState(false);
-  const [error,   setError]   = useState<string | null>(null);
+interface NoteRow {
+  id: string;
+  body: string;
+  is_customer_facing: number;
+  is_pinned: number;
+  created_by: string;
+  created_by_name: string | null;
+  created_at: string;
+}
 
-  async function handleSubmit(e: React.FormEvent) {
-    e.preventDefault();
-    setLoading(true);
-    setError(null);
+interface JobNotesProps {
+  jobId: string;
+  orgId: string;
+  userId: string;
+}
+
+export function JobNotes({ jobId, orgId, userId }: JobNotesProps) {
+  const [body,    setBody]    = useState('');
+  const [facing,  setFacing]  = useState(false);   // is_customer_facing
+  const [saving,  setSaving]  = useState(false);
+
+  const { data: notes } = useReactiveQuery<NoteRow>(`
+    SELECT
+      n.*,
+      u.name AS created_by_name
+    FROM job_notes n
+    LEFT JOIN users u ON u.id = n.created_by
+    WHERE n.job_id = ?
+    ORDER BY n.is_pinned DESC, n.created_at DESC
+  `, [jobId]);
+
+  async function handleAdd() {
+    const trimmed = body.trim();
+    if (!trimmed || saving) return;
+    setSaving(true);
     try {
-      const { error: err } = await supabase.auth.resetPasswordForEmail(email, {
-        redirectTo: `${window.location.origin}/auth/reset-password`,
+      await supabase.from('job_notes').insert({
+        org_id:             orgId,
+        job_id:             jobId,
+        created_by:         userId,
+        body:               trimmed,
+        is_customer_facing: facing ? 1 : 0,
+        is_pinned:          0,
       });
-      if (err) throw err;
-      setSent(true);
-    } catch (err) {
-      setError(err instanceof Error ? err.message : 'Failed to send reset email');
+      setBody('');
+      setFacing(false);
     } finally {
-      setLoading(false);
+      setSaving(false);
     }
   }
 
+  async function handleDelete(noteId: string) {
+    await supabase.from('job_notes').delete().eq('id', noteId);
+  }
+
   return (
-    <div className="min-h-[100dvh] flex flex-col bg-surface">
-      <div className="bg-brand px-6 pt-16 pb-10">
-        <h1 className="font-bold text-field-2xl text-white">Reset Password</h1>
-        <p className="text-field-sm text-white/70 mt-1">We'll send you a reset link</p>
-      </div>
-
-      <div className="flex-1 px-6 py-8">
-        {sent ? (
-          <div className="max-w-sm">
-            <div className="bg-surface-raised border border-success/20 rounded-card p-4 mb-6">
-              <p className="text-field-sm text-success font-semibold">Check your email</p>
-              <p className="text-field-xs text-content-secondary mt-1">
-                We sent a password reset link to {email}
-              </p>
-            </div>
-            <Button variant="secondary" fullWidth onClick={() => navigate('/auth/login')}>
-              Back to Sign In
-            </Button>
-          </div>
-        ) : (
-          <form onSubmit={handleSubmit} className="flex flex-col gap-5 max-w-sm">
-            <Field label="Email">
-              <Input
-                type="email"
-                placeholder="you@yourbusiness.com"
-                value={email}
-                onChange={e => setEmail(e.target.value)}
-                autoComplete="email"
-                required
-              />
-            </Field>
-
-            {error && (
-              <div className="bg-surface-raised border border-danger/20 rounded-card px-4 py-3">
-                <p className="text-field-sm text-danger">{error}</p>
+    <div className="space-y-3">
+      {/* Note list */}
+      {notes.map(note => (
+        <div key={note.id} className={`rounded-card border p-3 ${
+          note.is_pinned ? 'border-warning/30 bg-surface-raised' : 'border-surface-border bg-surface-raised'
+        }`}>
+          <div className="flex items-start gap-2">
+            <div className="flex-1 min-w-0">
+              <p className="text-field-sm text-content whitespace-pre-wrap">{note.body}</p>
+              <div className="flex items-center gap-2 mt-1.5 flex-wrap">
+                <span className="text-[10px] text-content-muted">
+                  {note.created_by_name ?? 'Unknown'} ·{' '}
+                  {formatDistanceToNow(new Date(note.created_at), { addSuffix: true })}
+                </span>
+                {note.is_customer_facing ? (
+                  <span className="text-[10px] font-semibold text-info bg-info/10 px-1.5 py-0.5 rounded">
+                    Customer-facing
+                  </span>
+                ) : (
+                  <span className="text-[10px] text-content-muted">Internal</span>
+                )}
+                {note.is_pinned ? <span className="text-[10px] text-warning">📌 Pinned</span> : null}
               </div>
+            </div>
+            {note.created_by === userId && (
+              <button
+                onClick={() => handleDelete(note.id)}
+                className="text-content-muted hover:text-danger transition-colors p-1 shrink-0"
+              >
+                <svg className="w-4 h-4" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
+                  <path strokeLinecap="round" strokeLinejoin="round" d="M6 18L18 6M6 6l12 12" />
+                </svg>
+              </button>
             )}
+          </div>
+        </div>
+      ))}
 
-            <Button type="submit" variant="primary" fullWidth loading={loading}>
-              Send Reset Link
-            </Button>
+      {notes.length === 0 && (
+        <p className="text-field-xs text-content-muted text-center py-4">No notes yet</p>
+      )}
 
-            <button
-              type="button"
-              className="text-field-sm text-brand font-medium text-center py-2 touch-manipulation"
-              onClick={() => navigate('/auth/login')}
-            >
-              Back to Sign In
-            </button>
-          </form>
-        )}
+      {/* Composer */}
+      <div className="space-y-2 pt-1">
+        <textarea
+          value={body}
+          onChange={e => setBody(e.target.value)}
+          placeholder="Add a note..."
+          rows={2}
+          className="w-full bg-surface-sunken text-content text-field-sm rounded-input px-3 py-2.5
+                     border border-surface-border focus:border-brand outline-none resize-none
+                     placeholder:text-content-muted"
+        />
+        <div className="flex items-center justify-between gap-3">
+          <label className="flex items-center gap-2 cursor-pointer">
+            <input
+              type="checkbox"
+              checked={facing}
+              onChange={e => setFacing(e.target.checked)}
+              className="w-4 h-4 accent-brand"
+            />
+            <span className="text-field-xs text-content-secondary">Customer-facing</span>
+          </label>
+          <button
+            onClick={handleAdd}
+            disabled={!body.trim() || saving}
+            className="h-9 px-4 bg-brand text-white text-field-xs font-bold rounded-button
+                       hover:bg-brand-mid transition-colors disabled:opacity-30"
+          >
+            {saving ? 'Saving…' : 'Add Note'}
+          </button>
+        </div>
       </div>
     </div>
   );
 }
 ```
 
-Add to `apps/pwa/src/App.tsx` in the public routes section:
-```tsx
-const ForgotPasswordPage = lazy(() => import('./pages/auth/ForgotPasswordPage'));
-// Add route alongside LoginPage:
-<Route path="/auth/forgot-password" element={<ForgotPasswordPage />} />
-```
-
----
-
-## TASK 7 — Build JobsPage
-
-Replace `apps/pwa/src/pages/JobsPage.tsx` entirely:
+## 3c. Create `apps/pwa/src/components/JobPhotos.tsx`
 
 ```tsx
-import React, { useState } from 'react';
-import { useNavigate } from 'react-router-dom';
-import { PageHeader, Section, Button, useReactiveQuery } from '@trades-saas/core-ui';
-import { JobCard } from '@trades-saas/core-ui';
-import type { JobCardData } from '@trades-saas/core-ui';
-import type { JobStatus } from '@trades-saas/core-types';
-import { JOB_STATUS_LABELS } from '@trades-saas/core-types';
-import { useAuth } from '../providers';
+import React, { useRef, useState } from 'react';
+import { useReactiveQuery } from '@trades-saas/core-ui';
+import { getSupabaseClient } from '@trades-saas/core-auth';
+import type { PhotoType } from '@trades-saas/core-types';
+import { PHOTO_TYPE_LABELS } from '@trades-saas/core-types';
 
-type Filter = 'all' | JobStatus;
+const supabase = getSupabaseClient();
 
-const FILTERS: { key: Filter; label: string }[] = [
-  { key: 'all',       label: 'All'         },
-  { key: 'lead',      label: 'Lead'        },
-  { key: 'scheduled', label: 'Scheduled'   },
-  { key: 'active',    label: 'In Progress' },
-  { key: 'complete',  label: 'Complete'    },
-  { key: 'closed',    label: 'Closed'      },
-];
-
-interface JobRow {
-  id: string; org_id: string; customer_id: string;
-  title: string; description: string | null; status: string; source: string;
-  assigned_to: string | null; location: string | null; trade_type: string | null;
-  scheduled_at: string | null; completed_at: string | null;
-  estimated_value_cents: number | null; final_value_cents: number | null;
-  job_number: string; created_at: string; updated_at: string;
-  customer_name: string; assigned_to_name: string | null;
-  estimate_total_cents: number | null;
+interface PhotoRow {
+  id: string;
+  photo_type: string;
+  storage_url: string;
+  filename: string;
+  caption: string | null;
+  created_at: string;
 }
 
-export default function JobsPage() {
-  const navigate = useNavigate();
-  const { org }  = useAuth();
-  const orgId    = org?.id ?? '';
-  const [filter, setFilter] = useState<Filter>('all');
+interface JobPhotosProps {
+  jobId: string;
+  orgId: string;
+  userId: string;
+}
 
-  const whereStatus = filter === 'all'
-    ? `status NOT IN ('cancelled')`
-    : `status = '${filter}'`;
+const PHOTO_TYPES: PhotoType[] = ['before', 'during', 'after', 'equipment', 'general'];
 
-  const { data: rows } = useReactiveQuery<JobRow>(`
-    SELECT
-      j.*,
-      c.name AS customer_name,
-      u.name AS assigned_to_name,
-      e.total_cents AS estimate_total_cents
-    FROM jobs j
-    LEFT JOIN customers  c ON c.id = j.customer_id
-    LEFT JOIN users      u ON u.id = j.assigned_to
-    LEFT JOIN estimates  e ON e.job_id = j.id AND e.status NOT IN ('declined')
-    WHERE j.org_id = ?
-      AND j.${whereStatus}
-    ORDER BY
-      CASE j.status
-        WHEN 'active'    THEN 1
-        WHEN 'scheduled' THEN 2
-        WHEN 'lead'      THEN 3
-        WHEN 'complete'  THEN 4
-        WHEN 'closed'    THEN 5
-        ELSE 6
-      END,
-      j.scheduled_at ASC,
-      j.created_at DESC
-    LIMIT 100
-  `, [orgId]);
+export function JobPhotos({ jobId, orgId, userId }: JobPhotosProps) {
+  const [uploading, setUploading] = useState<PhotoType | null>(null);
+  const [error,     setError]     = useState<string | null>(null);
+  const fileInputRef = useRef<HTMLInputElement>(null);
+  const [activeType, setActiveType] = useState<PhotoType>('before');
 
-  const jobs: JobCardData[] = rows.map(r => ({
-    job: {
-      id: r.id, org_id: r.org_id, customer_id: r.customer_id,
-      title: r.title, description: r.description,
-      status: r.status as JobStatus, source: r.source as any,
-      assigned_to: r.assigned_to, location: r.location, trade_type: r.trade_type as any,
-      scheduled_at: r.scheduled_at, completed_at: r.completed_at,
-      estimated_value_cents: r.estimated_value_cents, final_value_cents: r.final_value_cents,
-      job_number: r.job_number, created_at: r.created_at, updated_at: r.updated_at,
-    },
-    customer_name:    r.customer_name,
-    assigned_to_name: r.assigned_to_name,
-    ...(r.estimate_total_cents != null ? { estimate_total_cents: r.estimate_total_cents } : {}),
-  }));
+  const { data: photos } = useReactiveQuery<PhotoRow>(
+    'SELECT * FROM job_photos WHERE job_id = ? ORDER BY created_at DESC',
+    [jobId]
+  );
+
+  // Group photos by type
+  const byType = PHOTO_TYPES.reduce<Record<PhotoType, PhotoRow[]>>((acc, t) => {
+    acc[t] = photos.filter(p => p.photo_type === t);
+    return acc;
+  }, {} as Record<PhotoType, PhotoRow[]>);
+
+  async function handleFileSelected(e: React.ChangeEvent<HTMLInputElement>) {
+    const file = e.target.files?.[0];
+    if (!file) return;
+
+    setUploading(activeType);
+    setError(null);
+
+    try {
+      const ext      = file.name.split('.').pop() ?? 'jpg';
+      const filename = `${orgId}/${jobId}/${activeType}-${Date.now()}.${ext}`;
+
+      // Upload to Supabase Storage
+      const { error: uploadErr } = await supabase.storage
+        .from('job-photos')
+        .upload(filename, file, { contentType: file.type, upsert: false });
+
+      if (uploadErr) throw new Error(uploadErr.message);
+
+      // Get public-accessible signed URL (valid 1 year for inline display)
+      const { data: urlData } = await supabase.storage
+        .from('job-photos')
+        .createSignedUrl(filename, 31536000);
+
+      if (!urlData?.signedUrl) throw new Error('Could not get photo URL');
+
+      // Insert metadata record
+      await supabase.from('job_photos').insert({
+        org_id:            orgId,
+        job_id:            jobId,
+        uploaded_by:       userId,
+        photo_type:        activeType,
+        storage_path:      filename,
+        storage_url:       urlData.signedUrl,
+        filename:          file.name,
+        mime_type:         file.type,
+        size_bytes:        file.size,
+        include_in_report: activeType === 'before' || activeType === 'after' ? 1 : 0,
+      });
+    } catch (err) {
+      setError(err instanceof Error ? err.message : 'Upload failed');
+    } finally {
+      setUploading(null);
+      // Reset input so same file can be selected again
+      if (fileInputRef.current) fileInputRef.current.value = '';
+    }
+  }
+
+  async function handleDelete(photo: PhotoRow) {
+    // Delete from storage
+    await supabase.storage.from('job-photos').remove([photo.storage_url]);
+    // Delete metadata
+    await supabase.from('job_photos').delete().eq('id', photo.id);
+  }
 
   return (
-    <div className="flex flex-col h-full bg-surface">
-      <PageHeader
-        title="Jobs"
-        actions={
-          <Button variant="primary" size="sm" onClick={() => navigate('/jobs/new')}>
-            + New
-          </Button>
-        }
+    <div className="space-y-4">
+      {/* Hidden file input — camera on mobile */}
+      <input
+        ref={fileInputRef}
+        type="file"
+        accept="image/*"
+        capture="environment"
+        className="hidden"
+        onChange={handleFileSelected}
       />
 
-      {/* Status filter tabs */}
-      <div className="flex gap-1 overflow-x-auto px-4 py-3 border-b border-surface-border scrollbar-none">
-        {FILTERS.map(({ key, label }) => (
+      {/* Type tabs */}
+      <div className="flex gap-1 overflow-x-auto scrollbar-none">
+        {PHOTO_TYPES.map(t => (
           <button
-            key={key}
-            onClick={() => setFilter(key)}
+            key={t}
+            onClick={() => setActiveType(t)}
             className={`shrink-0 text-field-xs font-bold px-3 py-1.5 rounded-full transition-colors ${
-              filter === key
+              activeType === t
                 ? 'bg-brand text-white'
                 : 'text-content-secondary hover:text-content hover:bg-surface-raised'
             }`}
           >
-            {label}
+            {PHOTO_TYPE_LABELS[t]} ({byType[t].length})
           </button>
         ))}
       </div>
 
-      {/* Job list */}
-      <div className="flex-1 overflow-y-auto">
-        {jobs.length === 0 ? (
-          <div className="flex flex-col items-center justify-center h-64 text-center px-8">
-            <p className="text-field-sm font-bold text-content-secondary">No jobs</p>
-            <p className="text-field-xs text-content-muted mt-1">
-              {filter === 'all' ? 'Tap "+ New" to create your first job' : `No ${JOB_STATUS_LABELS[filter as JobStatus] ?? filter} jobs`}
-            </p>
-          </div>
-        ) : (
-          <div className="p-4 space-y-2">
-            {jobs.map(j => (
-              <JobCard
-                key={j.job.id}
-                {...j}
-                onPress={() => navigate(`/jobs/${j.job.id}`)}
-              />
-            ))}
-          </div>
-        )}
-      </div>
-    </div>
-  );
-}
-```
-
----
-
-## TASK 8 — Build JobDetailPage (most important task)
-
-This page handles both creating new jobs (`mode="new"`) and editing existing ones (`mode="edit"`).
-It also triggers RepuGuard when a job is marked complete.
-
-Replace `apps/pwa/src/pages/JobDetailPage.tsx` entirely:
-
-```tsx
-import React, { useState, useEffect } from 'react';
-import { useNavigate, useParams } from 'react-router-dom';
-import { PageHeader, Button, Field, Input, Section, Card, useReactiveQuery } from '@trades-saas/core-ui';
-import type { JobStatus, TradeType } from '@trades-saas/core-types';
-import { JOB_STATUS_LABELS, JOB_STATUS_ORDER, canAdvanceStatus } from '@trades-saas/core-types';
-import { STATUS_COLORS } from '@trades-saas/core-ui';
-import { getSupabaseClient } from '@trades-saas/core-auth';
-import { useAuth } from '../providers';
-
-const supabase = getSupabaseClient();
-
-// ─── Status badge ──────────────────────────────────────────────────────────────
-
-function StatusBadge({ status }: { status: JobStatus }) {
-  const colors = STATUS_COLORS[status as keyof typeof STATUS_COLORS] ?? STATUS_COLORS.lead;
-  return (
-    <span
-      className="text-field-xs font-bold px-2.5 py-1 rounded-badge capitalize"
-      style={{ background: colors.bg, color: colors.text, border: `1px solid ${colors.border}` }}
-    >
-      {JOB_STATUS_LABELS[status] ?? status}
-    </span>
-  );
-}
-
-// ─── Customer picker ──────────────────────────────────────────────────────────
-
-interface CustomerRow { id: string; name: string; phone: string | null; }
-
-function CustomerPicker({
-  value, orgId, onChange,
-}: { value: string; orgId: string; onChange: (id: string, name: string) => void }) {
-  const [search, setSearch] = useState('');
-  const [open,   setOpen]   = useState(false);
-
-  const { data: customers } = useReactiveQuery<CustomerRow>(
-    `SELECT id, name, phone FROM customers WHERE org_id = ?
-     AND (LOWER(name) LIKE LOWER(?) OR phone LIKE ?)
-     ORDER BY name LIMIT 20`,
-    [orgId, `%${search}%`, `%${search}%`]
-  );
-
-  const { data: selected } = useReactiveQuery<CustomerRow>(
-    `SELECT id, name, phone FROM customers WHERE id = ? LIMIT 1`,
-    [value]
-  );
-  const selectedCustomer = selected?.[0];
-
-  return (
-    <div className="relative">
-      <button
-        type="button"
-        onClick={() => setOpen(o => !o)}
-        className="w-full text-left bg-surface-sunken text-content text-field-sm rounded-input px-3 py-2.5
-                   border border-surface-border focus:border-brand outline-none h-touch"
-      >
-        {selectedCustomer ? (
-          <span className="text-content">{selectedCustomer.name}</span>
-        ) : (
-          <span className="text-content-muted">Select customer...</span>
-        )}
-      </button>
-
-      {open && (
-        <div className="absolute top-full left-0 right-0 z-50 bg-surface-raised border border-surface-border rounded-card shadow-raised mt-1 max-h-60 overflow-y-auto">
-          <div className="p-2 border-b border-surface-border">
-            <input
-              autoFocus
-              type="search"
-              value={search}
-              onChange={e => setSearch(e.target.value)}
-              placeholder="Search customers..."
-              className="w-full bg-surface-sunken text-content text-field-sm rounded px-3 py-2
-                         border border-surface-border focus:border-brand outline-none placeholder:text-content-muted"
+      {/* Photo grid for active type */}
+      <div className="grid grid-cols-3 gap-2">
+        {byType[activeType].map(photo => (
+          <div key={photo.id} className="relative aspect-square rounded-card overflow-hidden bg-surface-raised">
+            <img
+              src={photo.storage_url}
+              alt={photo.caption ?? photo.photo_type}
+              className="w-full h-full object-cover"
+              loading="lazy"
             />
+            <button
+              onClick={() => handleDelete(photo)}
+              className="absolute top-1 right-1 w-6 h-6 bg-black/60 rounded-full flex items-center
+                         justify-center text-white hover:bg-danger transition-colors"
+            >
+              <svg className="w-3 h-3" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={3}>
+                <path strokeLinecap="round" strokeLinejoin="round" d="M6 18L18 6M6 6l12 12" />
+              </svg>
+            </button>
           </div>
-          {customers.length === 0 ? (
-            <p className="text-field-xs text-content-muted text-center py-4">No customers found</p>
-          ) : (
-            customers.map(c => (
-              <button
-                key={c.id}
-                type="button"
-                onClick={() => { onChange(c.id, c.name); setOpen(false); setSearch(''); }}
-                className="w-full text-left px-3 py-2.5 hover:bg-surface-raised transition-colors border-b border-surface-border/50 last:border-0"
-              >
-                <p className="text-field-sm text-content">{c.name}</p>
-                {c.phone && <p className="text-field-xs text-content-muted">{c.phone}</p>}
-              </button>
-            ))
-          )}
-        </div>
-      )}
-    </div>
-  );
-}
+        ))}
 
-// ─── Main page ────────────────────────────────────────────────────────────────
-
-interface JobRow {
-  id: string; org_id: string; customer_id: string; title: string;
-  description: string | null; status: string; source: string;
-  assigned_to: string | null; location: string | null; trade_type: string | null;
-  scheduled_at: string | null; completed_at: string | null;
-  estimated_value_cents: number | null; final_value_cents: number | null;
-  job_number: string; created_at: string; updated_at: string;
-  customer_name: string | null;
-}
-
-export default function JobDetailPage({ mode }: { mode?: 'new' | 'edit' }) {
-  const navigate    = useNavigate();
-  const { id }      = useParams<{ id: string }>();
-  const { user, org } = useAuth();
-  const orgId       = org?.id ?? '';
-  const isNew       = mode === 'new' || !id;
-
-  // Load existing job if editing
-  const { data: jobRows } = useReactiveQuery<JobRow>(
-    `SELECT j.*, c.name AS customer_name
-     FROM jobs j
-     LEFT JOIN customers c ON c.id = j.customer_id
-     WHERE j.id = ? AND j.org_id = ? LIMIT 1`,
-    [id ?? '', orgId]
-  );
-  const existingJob = isNew ? null : (jobRows?.[0] ?? null);
-
-  // Form state
-  const [title,       setTitle]       = useState('');
-  const [customerId,  setCustomerId]  = useState('');
-  const [customerName, setCustomerName] = useState('');
-  const [description, setDescription] = useState('');
-  const [location,    setLocation]    = useState('');
-  const [tradeType,   setTradeType]   = useState<TradeType | ''>('');
-  const [scheduledAt, setScheduledAt] = useState('');
-  const [saving,      setSaving]      = useState(false);
-  const [error,       setError]       = useState<string | null>(null);
-
-  // Populate form when editing
-  useEffect(() => {
-    if (!existingJob) return;
-    setTitle(existingJob.title);
-    setCustomerId(existingJob.customer_id);
-    setCustomerName(existingJob.customer_name ?? '');
-    setDescription(existingJob.description ?? '');
-    setLocation(existingJob.location ?? '');
-    setTradeType((existingJob.trade_type as TradeType | null) ?? '');
-    setScheduledAt(existingJob.scheduled_at ? existingJob.scheduled_at.slice(0, 16) : '');
-  }, [existingJob?.id]);
-
-  const TRADE_TYPES: { value: TradeType | ''; label: string }[] = [
-    { value: '',                  label: 'Select trade...' },
-    { value: 'hvac',              label: 'HVAC'            },
-    { value: 'plumbing',          label: 'Plumbing'        },
-    { value: 'electrical',        label: 'Electrical'      },
-    { value: 'roofing',           label: 'Roofing'         },
-    { value: 'general_contractor',label: 'General Contractor' },
-    { value: 'landscaping',       label: 'Landscaping'     },
-    { value: 'painting',          label: 'Painting'        },
-    { value: 'flooring',          label: 'Flooring'        },
-    { value: 'pest_control',      label: 'Pest Control'    },
-    { value: 'other',             label: 'Other'           },
-  ];
-
-  async function handleSave() {
-    if (!title.trim()) { setError('Job title is required'); return; }
-    if (!customerId)   { setError('Please select a customer'); return; }
-    setSaving(true);
-    setError(null);
-
-    try {
-      if (isNew) {
-        const { data: newJob, error: err } = await supabase.from('jobs').insert({
-          org_id:      orgId,
-          customer_id: customerId,
-          title:       title.trim(),
-          description: description.trim() || null,
-          location:    location.trim() || null,
-          trade_type:  tradeType || null,
-          scheduled_at: scheduledAt || null,
-          status:      'lead',
-          source:      'manual',
-          assigned_to: user?.id ?? null,
-        }).select().single();
-
-        if (err) throw err;
-        navigate(`/jobs/${newJob.id}`, { replace: true });
-      } else {
-        const { error: err } = await supabase.from('jobs').update({
-          title:       title.trim(),
-          description: description.trim() || null,
-          location:    location.trim() || null,
-          trade_type:  tradeType || null,
-          scheduled_at: scheduledAt || null,
-        }).eq('id', id!).eq('org_id', orgId);
-
-        if (err) throw err;
-      }
-    } catch (e) {
-      setError(e instanceof Error ? e.message : 'Failed to save job');
-    } finally {
-      setSaving(false);
-    }
-  }
-
-  async function handleAdvanceStatus() {
-    if (!existingJob) return;
-    const currentStatus = existingJob.status as JobStatus;
-    const nextStatus    = canAdvanceStatus(currentStatus);
-    if (!nextStatus) return;
-
-    setSaving(true);
-    try {
-      const updates: Record<string, unknown> = { status: nextStatus };
-      if (nextStatus === 'complete') updates.completed_at = new Date().toISOString();
-
-      const { error: err } = await supabase
-        .from('jobs')
-        .update(updates)
-        .eq('id', existingJob.id)
-        .eq('org_id', orgId);
-
-      if (err) throw err;
-
-      // Fire RepuGuard when job reaches 'complete'
-      if (nextStatus === 'complete' && existingJob.customer_id) {
-        const { data: { session } } = await supabase.auth.getSession();
-        fetch(
-          `${import.meta.env.VITE_SUPABASE_URL}/functions/v1/trigger-repuguard`,
-          {
-            method: 'POST',
-            headers: {
-              'Authorization': `Bearer ${session?.access_token}`,
-              'Content-Type': 'application/json',
-            },
-            body: JSON.stringify({
-              job_id:      existingJob.id,
-              customer_id: existingJob.customer_id,
-              org_id:      orgId,
-            }),
-          }
-        ).catch(console.error); // fire-and-forget
-      }
-    } catch (e) {
-      setError(e instanceof Error ? e.message : 'Failed to update status');
-    } finally {
-      setSaving(false);
-    }
-  }
-
-  async function handleCancel() {
-    if (!existingJob) return;
-    if (!confirm('Cancel this job?')) return;
-    await supabase.from('jobs').update({ status: 'cancelled' }).eq('id', existingJob.id);
-    navigate('/jobs');
-  }
-
-  const currentStatus = (existingJob?.status as JobStatus | undefined) ?? 'lead';
-  const nextStatus    = canAdvanceStatus(currentStatus);
-
-  return (
-    <div className="flex flex-col min-h-full bg-surface pb-8">
-      <PageHeader
-        title={isNew ? 'New Job' : (existingJob?.job_number ?? 'Job')}
-        subtitle={isNew ? undefined : existingJob?.title}
-        onBack={() => navigate(-1)}
-        actions={
-          existingJob ? <StatusBadge status={currentStatus} /> : undefined
-        }
-      />
-
-      {error && (
-        <div className="mx-4 mt-3 p-3 bg-surface-raised border border-danger/20 rounded-card">
-          <p className="text-field-xs text-danger">{error}</p>
-        </div>
-      )}
-
-      {/* Status advance — only on existing jobs */}
-      {existingJob && nextStatus && (
-        <div className="px-4 pt-4">
-          <Button
-            variant="primary"
-            fullWidth
-            loading={saving}
-            onClick={handleAdvanceStatus}
-          >
-            Mark as {JOB_STATUS_LABELS[nextStatus]} →
-          </Button>
-        </div>
-      )}
-
-      {/* Job form */}
-      <Section title="Job Details" className="pt-4">
-        <Card elevation="raised" padding="md">
-          <div className="space-y-4">
-            <Field label="Job Title *">
-              <Input
-                value={title}
-                onChange={e => setTitle(e.target.value)}
-                placeholder="e.g. AC replacement + tune-up"
-              />
-            </Field>
-
-            <Field label="Customer *">
-              <CustomerPicker
-                value={customerId}
-                orgId={orgId}
-                onChange={(id, name) => { setCustomerId(id); setCustomerName(name); }}
-              />
-            </Field>
-
-            <Field label="Trade Type">
-              <select
-                value={tradeType}
-                onChange={e => setTradeType(e.target.value as TradeType | '')}
-                className="w-full bg-surface-sunken text-content text-field-sm rounded-input px-3 py-2.5
-                           border border-surface-border focus:border-brand outline-none h-touch"
-              >
-                {TRADE_TYPES.map(t => (
-                  <option key={t.value} value={t.value}>{t.label}</option>
-                ))}
-              </select>
-            </Field>
-
-            <Field label="Scheduled Date & Time">
-              <input
-                type="datetime-local"
-                value={scheduledAt}
-                onChange={e => setScheduledAt(e.target.value)}
-                className="w-full bg-surface-sunken text-content text-field-sm rounded-input px-3 py-2.5
-                           border border-surface-border focus:border-brand outline-none h-touch"
-              />
-            </Field>
-
-            <Field label="Location / Address">
-              <Input
-                value={location}
-                onChange={e => setLocation(e.target.value)}
-                placeholder="123 Main St, City, ST"
-              />
-            </Field>
-
-            <Field label="Description">
-              <textarea
-                value={description}
-                onChange={e => setDescription(e.target.value)}
-                placeholder="Details about the job..."
-                rows={3}
-                className="w-full bg-surface-sunken text-content text-field-sm rounded-input px-3 py-2.5
-                           border border-surface-border focus:border-brand outline-none resize-none
-                           placeholder:text-content-muted"
-              />
-            </Field>
-          </div>
-        </Card>
-      </Section>
-
-      {/* Save button */}
-      <div className="px-4 pt-2">
-        <Button
-          variant={isNew ? 'primary' : 'secondary'}
-          fullWidth
-          loading={saving}
-          onClick={handleSave}
+        {/* Add photo button */}
+        <button
+          onClick={() => fileInputRef.current?.click()}
+          disabled={uploading !== null}
+          className="aspect-square rounded-card border-2 border-dashed border-surface-border
+                     flex flex-col items-center justify-center gap-1 bg-surface-raised
+                     hover:border-brand hover:bg-surface transition-colors disabled:opacity-40"
         >
-          {isNew ? 'Create Job' : 'Save Changes'}
-        </Button>
+          {uploading === activeType ? (
+            <span className="w-5 h-5 border-2 border-surface-border border-t-brand rounded-full animate-spin" />
+          ) : (
+            <>
+              <svg className="w-6 h-6 text-content-muted" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={1.5}>
+                <path strokeLinecap="round" strokeLinejoin="round" d="M6.827 6.175A2.31 2.31 0 015.186 7.23c-.38.054-.757.112-1.134.175C2.999 7.58 2.25 8.507 2.25 9.574V18a2.25 2.25 0 002.25 2.25h15A2.25 2.25 0 0021.75 18V9.574c0-1.067-.75-1.994-1.802-2.169a47.865 47.865 0 00-1.134-.175 2.31 2.31 0 01-1.64-1.055l-.822-1.316a2.192 2.192 0 00-1.736-1.039 48.774 48.774 0 00-5.232 0 2.192 2.192 0 00-1.736 1.039l-.821 1.316z" />
+                <path strokeLinecap="round" strokeLinejoin="round" d="M16.5 12.75a4.5 4.5 0 11-9 0 4.5 4.5 0 019 0zM18.75 10.5h.008v.008h-.008V10.5z" />
+              </svg>
+              <span className="text-[10px] text-content-muted font-medium">Photo</span>
+            </>
+          )}
+        </button>
       </div>
 
-      {/* Cancel job — only for non-terminal existing jobs */}
-      {existingJob && !['closed', 'cancelled'].includes(currentStatus) && (
-        <div className="px-4 pt-2">
-          <Button variant="ghost" fullWidth onClick={handleCancel}>
-            Cancel Job
-          </Button>
-        </div>
-      )}
+      {error && <p className="text-field-xs text-danger">{error}</p>}
     </div>
   );
 }
 ```
 
----
+## 3d. Add Notes and Photos sections to JobDetailPage
 
-## TASK 9 — Build CustomersPage
+Open `apps/pwa/src/pages/JobDetailPage.tsx`.
 
-Replace `apps/pwa/src/pages/CustomersPage.tsx` entirely:
+Add imports at the top:
+```tsx
+import { JobNotes }  from '../components/JobNotes';
+import { JobPhotos } from '../components/JobPhotos';
+```
+
+Inside the return, after the "Save Changes" and "Cancel Job" buttons, add a new section — but only render it when editing an existing job (not when creating new):
 
 ```tsx
-import React, { useState } from 'react';
-import { useNavigate } from 'react-router-dom';
-import { PageHeader, Button, Section, Card, useReactiveQuery } from '@trades-saas/core-ui';
-import { getSupabaseClient } from '@trades-saas/core-auth';
-import { useAuth } from '../providers';
-
-const supabase = getSupabaseClient();
-
-interface CustomerRow {
-  id: string; name: string; phone: string | null; email: string | null;
-  address: string | null; notes: string | null; created_at: string;
-  job_count: number; open_job_count: number;
-}
-
-function formatPhone(phone: string | null) {
-  if (!phone) return null;
-  return phone.replace(/^\+1(\d{3})(\d{3})(\d{4})$/, '($1) $2-$3') ?? phone;
-}
-
-export default function CustomersPage() {
-  const navigate = useNavigate();
-  const { org }  = useAuth();
-  const orgId    = org?.id ?? '';
-  const [search, setSearch] = useState('');
-  const [showNew, setShowNew] = useState(false);
-
-  // New customer form
-  const [form, setForm] = useState({ name: '', phone: '', email: '', address: '' });
-  const [saving, setSaving] = useState(false);
-  const [error,  setError]  = useState<string | null>(null);
-
-  const { data: customers } = useReactiveQuery<CustomerRow>(`
-    SELECT
-      c.*,
-      COUNT(j.id)                                                     AS job_count,
-      COUNT(CASE WHEN j.status NOT IN ('closed','cancelled') THEN 1 END) AS open_job_count
-    FROM customers c
-    LEFT JOIN jobs j ON j.customer_id = c.id
-    WHERE c.org_id = ?
-      ${search ? `AND (LOWER(c.name) LIKE LOWER('%${search}%') OR c.phone LIKE '%${search}%' OR LOWER(c.email) LIKE LOWER('%${search}%'))` : ''}
-    GROUP BY c.id
-    ORDER BY c.name ASC
-    LIMIT 100
-  `, [orgId]);
-
-  async function handleCreate() {
-    if (!form.name.trim()) { setError('Name is required'); return; }
-    setSaving(true);
-    setError(null);
-    try {
-      const { error: err } = await supabase.from('customers').insert({
-        org_id:  orgId,
-        name:    form.name.trim(),
-        phone:   form.phone.trim() || null,
-        email:   form.email.trim() || null,
-        address: form.address.trim() || null,
-      });
-      if (err) throw err;
-      setForm({ name: '', phone: '', email: '', address: '' });
-      setShowNew(false);
-    } catch (e) {
-      setError(e instanceof Error ? e.message : 'Failed to create customer');
-    } finally {
-      setSaving(false);
-    }
-  }
-
-  return (
-    <div className="flex flex-col h-full bg-surface">
-      <PageHeader
-        title="Customers"
-        actions={
-          <Button variant="primary" size="sm" onClick={() => setShowNew(n => !n)}>
-            {showNew ? 'Cancel' : '+ New'}
-          </Button>
-        }
+{/* Notes & Photos — only on existing jobs */}
+{!isNew && existingJob && (
+  <>
+    {/* Divider */}
+    <div className="mx-4 border-t border-surface-border pt-6">
+      <h2 className="text-field-xs font-bold text-content-secondary uppercase tracking-widest mb-4">
+        Field Notes
+      </h2>
+      <JobNotes
+        jobId={existingJob.id}
+        orgId={orgId}
+        userId={user?.id ?? ''}
       />
-
-      {/* New customer form */}
-      {showNew && (
-        <div className="px-4 py-4 border-b border-surface-border bg-surface-raised space-y-3">
-          <p className="text-field-xs font-bold text-content-secondary uppercase tracking-widest">
-            New Customer
-          </p>
-          {error && <p className="text-field-xs text-danger">{error}</p>}
-          {[
-            { key: 'name',    label: 'Name *',    type: 'text',  placeholder: 'John Smith'           },
-            { key: 'phone',   label: 'Phone',     type: 'tel',   placeholder: '+15551234567'          },
-            { key: 'email',   label: 'Email',     type: 'email', placeholder: 'john@example.com'     },
-            { key: 'address', label: 'Address',   type: 'text',  placeholder: '123 Main St'          },
-          ].map(({ key, label, type, placeholder }) => (
-            <div key={key}>
-              <label className="block text-field-xs font-semibold text-content-secondary mb-1">{label}</label>
-              <input
-                type={type}
-                value={(form as any)[key]}
-                onChange={e => setForm(f => ({ ...f, [key]: e.target.value }))}
-                placeholder={placeholder}
-                className="w-full bg-surface-sunken text-content text-field-sm rounded-input px-3 py-2.5
-                           border border-surface-border focus:border-brand outline-none placeholder:text-content-muted"
-              />
-            </div>
-          ))}
-          <Button variant="primary" fullWidth loading={saving} onClick={handleCreate}>
-            Create Customer
-          </Button>
-        </div>
-      )}
-
-      {/* Search */}
-      <div className="px-4 py-3 border-b border-surface-border">
-        <input
-          type="search"
-          value={search}
-          onChange={e => setSearch(e.target.value)}
-          placeholder="Search by name, phone, email…"
-          className="w-full bg-surface-sunken text-content text-field-sm rounded-input px-3 py-2.5
-                     border border-surface-border focus:border-brand outline-none placeholder:text-content-muted"
-        />
-      </div>
-
-      {/* Customer list */}
-      <div className="flex-1 overflow-y-auto divide-y divide-surface-border">
-        {customers.length === 0 ? (
-          <div className="flex flex-col items-center justify-center h-64 text-center px-8">
-            <p className="text-field-sm font-bold text-content-secondary">
-              {search ? 'No customers match your search' : 'No customers yet'}
-            </p>
-            <p className="text-field-xs text-content-muted mt-1">
-              {!search && 'Tap "+ New" to add your first customer'}
-            </p>
-          </div>
-        ) : (
-          customers.map(customer => (
-            <button
-              key={customer.id}
-              onClick={() => navigate(`/jobs?customer=${customer.id}`)}
-              className="w-full text-left px-4 py-3.5 hover:bg-surface-raised active:bg-surface-raised/80 transition-colors"
-            >
-              <div className="flex items-start justify-between gap-3">
-                <div className="flex-1 min-w-0">
-                  <p className="text-field-sm font-semibold text-content truncate">{customer.name}</p>
-                  {customer.phone && (
-                    <p className="text-field-xs text-content-secondary mt-0.5">
-                      {formatPhone(customer.phone)}
-                    </p>
-                  )}
-                  {customer.email && (
-                    <p className="text-field-xs text-content-muted truncate">{customer.email}</p>
-                  )}
-                </div>
-                <div className="text-right shrink-0">
-                  {customer.open_job_count > 0 ? (
-                    <span className="text-field-xs font-bold text-brand">
-                      {customer.open_job_count} open job{customer.open_job_count !== 1 ? 's' : ''}
-                    </span>
-                  ) : (
-                    <span className="text-field-xs text-content-muted">
-                      {customer.job_count} job{customer.job_count !== 1 ? 's' : ''}
-                    </span>
-                  )}
-                </div>
-              </div>
-            </button>
-          ))
-        )}
-      </div>
     </div>
-  );
-}
+
+    <div className="mx-4 border-t border-surface-border pt-6">
+      <h2 className="text-field-xs font-bold text-content-secondary uppercase tracking-widest mb-4">
+        Photos
+      </h2>
+      <JobPhotos
+        jobId={existingJob.id}
+        orgId={orgId}
+        userId={user?.id ?? ''}
+      />
+    </div>
+  </>
+)}
 ```
 
 ---
 
-## TASK 10 — Final checks
+# TASK 4 — Final checks
 
 ```bash
 # Clean install
 pnpm install
 
-# Type-check everything — fix every error
+# Type-check everything
 pnpm turbo typecheck
 
-# Verify stubs are gone — these should NOT contain "Coming in module build session":
-grep -l "Coming in module build session" apps/pwa/src/pages/*.tsx
-# Should return empty
-
-# Verify manifest.json is deleted:
-ls apps/pwa/public/manifest.json 2>/dev/null && echo "DELETE THIS FILE" || echo "OK — file removed"
-
-# Verify review delay default is 24, not 2:
-grep "review_delay_hours ?? " apps/pwa/src/pages/settings/SettingsPage.tsx
-
-# Verify trigger-repuguard is called in JobDetailPage:
-grep "trigger-repuguard" apps/pwa/src/pages/JobDetailPage.tsx
-
-# Build to catch any bundle errors:
+# Build
 pnpm --filter @trades-saas/pwa build
+
+# Spot-checks:
+
+# 1. Customer filter works
+grep "useSearchParams" apps/pwa/src/pages/JobsPage.tsx
+
+# 2. createInvoice hook exists
+grep "createInvoice" modules/estimates/src/hooks/useEstimates.ts
+
+# 3. Convert to Invoice button exists
+grep "Convert to Invoice" modules/estimates/src/pages/EstimateDetailPage.tsx
+
+# 4. JobNotes component exists
+ls apps/pwa/src/components/JobNotes.tsx
+
+# 5. JobPhotos component exists
+ls apps/pwa/src/components/JobPhotos.tsx
+
+# 6. Photo storage bucket migration exists
+ls supabase/migrations/20260517_storage_photos.sql
+
+# 7. Notes and Photos sections wired into JobDetailPage
+grep "JobNotes" apps/pwa/src/pages/JobDetailPage.tsx
+grep "JobPhotos" apps/pwa/src/pages/JobDetailPage.tsx
 ```
 
 ---
@@ -1015,10 +764,8 @@ pnpm --filter @trades-saas/pwa build
 ## HARD RULES REMINDER
 
 - `@trades-saas/` prefix only
-- Inter font only
+- Inter font only — no other fonts
 - Token classes only — no hex in components
-- PowerSync reads — never Supabase in components
-- Cents in DB, dollars in display
-- `set_updated_at()` exists — never redefine
-- Edge Functions: Deno with `https://esm.sh/` imports
-- 48px minimum touch targets
+- PowerSync reads in components — never Supabase
+- Cents in DB — dollars in display
+- 48px touch targets
