@@ -20,6 +20,7 @@ const STATUS_STYLE: Record<EstimateStatus, { text: string; dot: string }> = {
   declined:   { text: 'text-danger',         dot: 'bg-danger'         },
   invoiced:   { text: 'text-brand',          dot: 'bg-brand'          },
   paid:       { text: 'text-success',        dot: 'bg-success'        },
+  superseded: { text: 'text-content-muted',  dot: 'bg-content-muted'  },
 };
 
 function fmt(cents: number) {

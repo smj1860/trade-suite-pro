@@ -5,7 +5,8 @@ export type EstimateStatus =
   | 'accepted'
   | 'declined'
   | 'invoiced'
-  | 'paid';
+  | 'paid'
+  | 'superseded';
 
 export type PriceUnit = 'each' | 'hour' | 'sqft' | 'lnft' | 'ton' | 'lb' | 'ft';
 
@@ -93,4 +94,31 @@ export interface EstimateSentEvent {
     customer_email: string;
     customer_name: string | null;
   };
+}
+
+export type InvoiceStatus = 'draft' | 'sent' | 'viewed' | 'partial' | 'paid' | 'overdue' | 'void';
+
+export interface Invoice {
+  id: string;
+  org_id: string;
+  job_id: string;
+  customer_id: string;
+  created_by: string;
+  estimate_id: string | null;
+  invoice_number: string;
+  status: InvoiceStatus;
+  subtotal_cents: number;
+  tax_cents: number;
+  tax_rate: number;
+  total_cents: number;
+  balance_cents: number;
+  due_date: string | null;
+  sent_at: string | null;
+  viewed_at: string | null;
+  paid_at: string | null;
+  payment_link_url: string | null;
+  view_token: string | null;
+  customer_note: string | null;
+  created_at: string;
+  updated_at: string;
 }

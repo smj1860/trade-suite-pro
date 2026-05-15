@@ -13,12 +13,15 @@ function fmt(cents: number) {
 export function EstimateDetailPage() {
   const { estimateId } = useParams<{ estimateId: string }>();
   const navigate       = useNavigate();
-  const [showPicker, setShowPicker] = useState(false);
-  const [sending, setSending]       = useState(false);
+  const [showPicker,  setShowPicker]  = useState(false);
+  const [sending,     setSending]     = useState(false);
+  const [converting,  setConverting]  = useState(false);
+  const [invoiceId,   setInvoiceId]   = useState<string | null>(null);
+  const [sendingInv,  setSendingInv]  = useState(false);
 
   const { data: estimates }         = useEstimate(estimateId!);
   const { data: items }             = useEstimateItems(estimateId!);
-  const { addLineItem, updateLineItem, removeLineItem, sendEstimate } = useEstimateActions();
+  const { addLineItem, updateLineItem, removeLineItem, sendEstimate, createInvoice, sendInvoice } = useEstimateActions();
 
   const estimate = estimates?.[0] ?? null;
   const isDraft  = estimate?.status === 'draft';
@@ -70,6 +73,29 @@ export function EstimateDetailPage() {
       await sendEstimate(estimate!.id);
     } finally {
       setSending(false);
+    }
+  }
+
+  async function handleConvertToInvoice() {
+    if (!estimate || converting) return;
+    setConverting(true);
+    try {
+      const { id } = await createInvoice(estimate.id);
+      setInvoiceId(id);
+    } catch (err) {
+      console.error('Convert to invoice failed:', err);
+    } finally {
+      setConverting(false);
+    }
+  }
+
+  async function handleSendInvoice() {
+    if (!invoiceId || sendingInv) return;
+    setSendingInv(true);
+    try {
+      await sendInvoice(invoiceId);
+    } finally {
+      setSendingInv(false);
     }
   }
 
@@ -165,6 +191,49 @@ export function EstimateDetailPage() {
                   Send Estimate
                 </>
               )}
+            </button>
+          </div>
+        )}
+
+        {estimate.status === 'accepted' && !invoiceId && (
+          <div className="p-4 border-t border-surface-border">
+            <button
+              onClick={handleConvertToInvoice}
+              disabled={converting}
+              className="w-full h-touch bg-brand text-white font-bold text-field-sm rounded-button
+                         hover:bg-brand-mid active:scale-[0.99] transition-all disabled:opacity-40
+                         flex items-center justify-center gap-2"
+            >
+              {converting ? (
+                <span className="w-5 h-5 border-2 border-white/30 border-t-white rounded-full animate-spin" />
+              ) : (
+                <>
+                  <svg className="w-5 h-5" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
+                    <path strokeLinecap="round" strokeLinejoin="round" d="M9 12h6m-6 4h6m2 5H7a2 2 0 01-2-2V5a2 2 0 012-2h5.586a1 1 0 01.707.293l5.414 5.414a1 1 0 01.293.707V19a2 2 0 01-2 2z" />
+                  </svg>
+                  Convert to Invoice
+                </>
+              )}
+            </button>
+          </div>
+        )}
+
+        {invoiceId && (
+          <div className="p-4 border-t border-surface-border space-y-2">
+            <div className="bg-surface-raised border border-success/20 rounded-card px-4 py-3">
+              <p className="text-field-xs text-success font-semibold">Invoice created</p>
+              <p className="text-field-xs text-content-muted mt-0.5">Send it to the customer to collect payment</p>
+            </div>
+            <button
+              onClick={handleSendInvoice}
+              disabled={sendingInv}
+              className="w-full h-touch bg-brand text-white font-bold text-field-sm rounded-button
+                         hover:bg-brand-mid active:scale-[0.99] transition-all disabled:opacity-40
+                         flex items-center justify-center gap-2"
+            >
+              {sendingInv ? (
+                <span className="w-5 h-5 border-2 border-white/30 border-t-white rounded-full animate-spin" />
+              ) : 'Send Invoice & Payment Link'}
             </button>
           </div>
         )}

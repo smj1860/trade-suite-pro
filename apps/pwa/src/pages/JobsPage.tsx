@@ -1,5 +1,5 @@
 import React, { useState } from 'react';
-import { useNavigate } from 'react-router-dom';
+import { useNavigate, useSearchParams } from 'react-router-dom';
 import { PageHeader, Button, JobCard, useReactiveQuery } from '@trades-saas/core-ui';
 import type { JobCardData } from '@trades-saas/core-ui';
 import type { JobStatus } from '@trades-saas/core-types';
@@ -33,10 +33,13 @@ export default function JobsPage() {
   const { org }  = useAuth();
   const orgId    = org?.id ?? '';
   const [filter, setFilter] = useState<Filter>('all');
+  const [searchParams] = useSearchParams();
+  const customerFilter = searchParams.get('customer');
 
-  const whereStatus = filter === 'all'
+  const whereStatus    = filter === 'all'
     ? `status NOT IN ('cancelled')`
     : `status = '${filter}'`;
+  const customerClause = customerFilter ? `AND j.customer_id = '${customerFilter}'` : '';
 
   const { data: rows } = useReactiveQuery<JobRow>(`
     SELECT
@@ -47,9 +50,10 @@ export default function JobsPage() {
     FROM jobs j
     LEFT JOIN customers  c ON c.id = j.customer_id
     LEFT JOIN users      u ON u.id = j.assigned_to
-    LEFT JOIN estimates  e ON e.job_id = j.id AND e.status NOT IN ('declined')
+    LEFT JOIN estimates  e ON e.job_id = j.id AND e.status NOT IN ('declined', 'rejected', 'expired', 'superseded')
     WHERE j.org_id = ?
       AND j.${whereStatus}
+      ${customerClause}
     ORDER BY
       CASE j.status
         WHEN 'active'    THEN 1
@@ -63,6 +67,14 @@ export default function JobsPage() {
       j.created_at DESC
     LIMIT 100
   `, [orgId]);
+
+  const { data: customerRows } = useReactiveQuery<{ name: string }>(
+    customerFilter
+      ? `SELECT name FROM customers WHERE id = ? LIMIT 1`
+      : `SELECT '' AS name WHERE 0`,
+    customerFilter ? [customerFilter] : []
+  );
+  const customerName = customerRows?.[0]?.name;
 
   const jobs: JobCardData[] = rows.map(r => ({
     job: {
@@ -89,6 +101,21 @@ export default function JobsPage() {
           </Button>
         }
       />
+
+      {/* Customer filter banner */}
+      {customerFilter && customerName && (
+        <div className="flex items-center justify-between px-4 py-2 bg-surface-raised border-b border-surface-border">
+          <p className="text-field-xs text-content-secondary">
+            Jobs for <span className="font-semibold text-content">{customerName}</span>
+          </p>
+          <button
+            onClick={() => navigate('/jobs')}
+            className="text-field-xs text-brand font-semibold touch-manipulation"
+          >
+            Clear
+          </button>
+        </div>
+      )}
 
       {/* Status filter tabs */}
       <div className="flex gap-1 overflow-x-auto px-4 py-3 border-b border-surface-border scrollbar-none">

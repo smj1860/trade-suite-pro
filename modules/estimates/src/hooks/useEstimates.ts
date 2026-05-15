@@ -1,7 +1,7 @@
 import { useQuery } from '@powersync/react';
 import { useCallback } from 'react';
 import { getSupabaseClient } from '@trades-saas/core-auth';
-import type { Estimate, EstimateItem, EstimateStatus, PriceBookItem } from '../types';
+import type { Estimate, EstimateItem, EstimateStatus, Invoice, PriceBookItem } from '../types';
 
 const supabase = getSupabaseClient();
 
@@ -117,5 +117,47 @@ export function useEstimateActions() {
     return res.json() as Promise<{ pdf_url: string; payment_link_url: string }>;
   }, []);
 
-  return { addLineItem, updateLineItem, removeLineItem, createEstimate, sendEstimate, sendInvoice, parseVoice };
+  const createInvoice = useCallback(async (estimateId: string): Promise<{ id: string }> => {
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const { data: est, error: estErr } = await (supabase.from('estimates') as any)
+      .select('org_id, job_id, customer_id, subtotal_cents, tax_cents, tax_rate, total_cents, customer_note, created_by')
+      .eq('id', estimateId)
+      .single();
+    if (estErr || !est) throw new Error('Estimate not found');
+
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const { data: inv, error: invErr } = await (supabase.from('invoices') as any)
+      .insert({
+        org_id:         est.org_id,
+        job_id:         est.job_id,
+        customer_id:    est.customer_id,
+        created_by:     est.created_by,
+        estimate_id:    estimateId,
+        subtotal_cents: est.subtotal_cents,
+        tax_cents:      est.tax_cents,
+        tax_rate:       est.tax_rate,
+        total_cents:    est.total_cents,
+        balance_cents:  est.total_cents,
+        customer_note:  est.customer_note,
+        status:         'draft',
+      })
+      .select('id')
+      .single();
+    if (invErr || !inv) throw new Error(invErr?.message ?? 'Failed to create invoice');
+
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    await (supabase.from('estimates') as any).update({ status: 'superseded' }).eq('id', estimateId);
+
+    return { id: inv.id };
+  }, []);
+
+  return { addLineItem, updateLineItem, removeLineItem, createEstimate, sendEstimate, sendInvoice, createInvoice, parseVoice };
+}
+
+export function useInvoice(invoiceId: string) {
+  return useQuery<Invoice>('SELECT * FROM invoices WHERE id = ? LIMIT 1', [invoiceId]);
+}
+
+export function useJobInvoices(jobId: string) {
+  return useQuery<Invoice>('SELECT * FROM invoices WHERE job_id = ? ORDER BY created_at DESC', [jobId]);
 }

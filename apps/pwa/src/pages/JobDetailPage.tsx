@@ -5,6 +5,8 @@ import type { JobStatus, TradeType } from '@trades-saas/core-types';
 import { JOB_STATUS_LABELS, JOB_STATUS_ORDER, canAdvanceStatus } from '@trades-saas/core-types';
 import { getSupabaseClient } from '@trades-saas/core-auth';
 import { useAuth } from '../providers';
+import { JobNotes }  from '../components/JobNotes';
+import { JobPhotos } from '../components/JobPhotos';
 
 const supabase = getSupabaseClient();
 
@@ -355,6 +357,33 @@ export default function JobDetailPage({ mode }: { mode?: 'new' | 'edit' }) {
             Cancel Job
           </Button>
         </div>
+      )}
+
+      {/* Notes & Photos — only on existing jobs */}
+      {!isNew && existingJob && (
+        <>
+          <div className="mx-4 border-t border-surface-border pt-6 mt-4">
+            <h2 className="text-field-xs font-bold text-content-secondary uppercase tracking-widest mb-4">
+              Field Notes
+            </h2>
+            <JobNotes
+              jobId={existingJob.id}
+              orgId={orgId}
+              userId={user?.id ?? ''}
+            />
+          </div>
+
+          <div className="mx-4 border-t border-surface-border pt-6 mt-6">
+            <h2 className="text-field-xs font-bold text-content-secondary uppercase tracking-widest mb-4">
+              Photos
+            </h2>
+            <JobPhotos
+              jobId={existingJob.id}
+              orgId={orgId}
+              userId={user?.id ?? ''}
+            />
+          </div>
+        </>
       )}
     </div>
   );
